@@ -1,11 +1,11 @@
 {
   inputs = {
-    nixpkgs.url = "github:nixos-bsd/nixpkgs/openbsd-phase1-split";
+    nixpkgs.url = "github:obsidiansystems/bsd-nixpkgs/openbsd-phase1-split";
   };
 
   nixConfig = {
-    extra-substituters = [ "https://attic.mildlyfunctional.gay/nixbsd" ];
-    extra-trusted-public-keys = [ "nixbsd:gwcQlsUONBLrrGCOdEboIAeFq9eLaDqfhfXmHZs1mgc=" ];
+    extra-substituters = [ "https://obsidian-open-source.s3.us-east-1.amazonaws.com" ];
+    extra-trusted-public-keys = [ "obsidian-open-source:KP1UbL7OIibSjFo9/2tiHCYLm/gJMfy8Tim7+7P4o0I=" ];
   };
 
   outputs =

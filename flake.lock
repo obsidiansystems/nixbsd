@@ -4,15 +4,15 @@
       "locked": {
         "lastModified": 1731628575,
         "narHash": "sha256-40tQjKXGNDbdfN3kyUGm6nW6YSUimjGyb46RiFWkb/8=",
-        "owner": "nixos-bsd",
-        "repo": "nixpkgs",
+        "owner": "obsidiansystems",
+        "repo": "bsd-nixpkgs",
         "rev": "fe648aebf4490b64db4a9c535ccb5218199d1250",
         "type": "github"
       },
       "original": {
-        "owner": "nixos-bsd",
+        "owner": "obsidiansystems",
         "ref": "openbsd-phase1-split",
-        "repo": "nixpkgs",
+        "repo": "bsd-nixpkgs",
         "type": "github"
       }
     },

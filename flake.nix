@@ -1,6 +1,6 @@
 {
   inputs = {
-    nixpkgs.url = "github:rhelmot/nixpkgs/nixbsd-dev";
+    nixpkgs.url = "github:obsidiansystems/bsd-nixpkgs/a846fa7e092552e9e7636233f118d5f61a97dc82";
     utils.url = "github:numtide/flake-utils";
     nix = {
       url = "github:rhelmot/nix/freebsd-staging";

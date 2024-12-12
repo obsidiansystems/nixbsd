@@ -82,15 +82,15 @@
       "locked": {
         "lastModified": 1733230502,
         "narHash": "sha256-p0DT9I/TutnBlNANjYBY5e+Av47a1keDIWDM1ItU/Mo=",
-        "owner": "rhelmot",
-        "repo": "nixpkgs",
+        "owner": "obsidiansystems",
+        "repo": "bsd-nixpkgs",
         "rev": "a846fa7e092552e9e7636233f118d5f61a97dc82",
         "type": "github"
       },
       "original": {
-        "owner": "rhelmot",
-        "ref": "nixbsd-dev",
-        "repo": "nixpkgs",
+        "owner": "obsidiansystems",
+        "repo": "bsd-nixpkgs",
+        "rev": "a846fa7e092552e9e7636233f118d5f61a97dc82",
         "type": "github"
       }
     },

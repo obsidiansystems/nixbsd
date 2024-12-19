@@ -16,9 +16,8 @@
   };
 
   nixConfig = {
-    extra-substituters = [ "https://attic.mildlyfunctional.gay/nixbsd" ];
-    extra-trusted-public-keys =
-      [ "nixbsd:gwcQlsUONBLrrGCOdEboIAeFq9eLaDqfhfXmHZs1mgc=" ];
+    extra-substituters = [ "https://nixcache.reflex-frp.org" ];
+    extra-trusted-public-keys = [ "ryantrinkle.com-1:JJiAKaRv9mWgpVAz8dwewnZe0AzzEAzPkagE9SP5NWI=" ];
   };
 
   outputs = { self, nixpkgs, utils, nix, mini-tmpfiles }:
@@ -30,6 +29,34 @@
         self.lib.nixbsdSystem {
           modules = [ module {  } ];
         };
+      allSystems = (utils.lib.eachSystem supportedSystems (system:
+        let
+          makeImage = conf:
+            let
+              extended = conf.extendModules {
+                modules = [{ config.nixpkgs.buildPlatform = system; }];
+              };
+            in extended.config.system.build // {
+              # appease `nix flake show`
+              type = "derivation";
+              name = "system-build";
+
+              closureInfo = extended.pkgs.closureInfo {
+                rootPaths = [ extended.config.system.build.toplevel.drvPath ];
+              };
+              vmClosureInfo = extended.pkgs.closureInfo {
+                rootPaths = [ extended.config.system.build.vm.drvPath ];
+              };
+              inherit (extended) pkgs;
+            };
+          pkgs = import nixpkgs { inherit system; };
+        in {
+          packages = lib.mapAttrs'
+            (name: value: lib.nameValuePair "${name}" (makeImage value))
+            self.nixosConfigurations;
+
+          formatter = pkgs.nixfmt;
+        }));
     in {
       lib.nixbsdSystem = args:
         import ./lib/eval-config.nix (args // {
@@ -43,33 +70,8 @@
 
       nixosConfigurations =
         lib.mapAttrs (name: _: makeSystem name (configBase + "/${name}"))
-        (builtins.readDir configBase);
-    } // (utils.lib.eachSystem supportedSystems (system:
-      let
-        makeImage = conf:
-          let
-            extended = conf.extendModules {
-              modules = [{ config.nixpkgs.buildPlatform = system; }];
-            };
-          in extended.config.system.build // {
-            # appease `nix flake show`
-            type = "derivation";
-            name = "system-build";
+          (builtins.readDir configBase);
 
-            closureInfo = extended.pkgs.closureInfo {
-              rootPaths = [ extended.config.system.build.toplevel.drvPath ];
-            };
-            vmClosureInfo = extended.pkgs.closureInfo {
-              rootPaths = [ extended.config.system.build.vm.drvPath ];
-            };
-            inherit (extended) pkgs;
-          };
-        pkgs = import nixpkgs { inherit system; };
-      in {
-        packages = lib.mapAttrs'
-          (name: value: lib.nameValuePair "${name}" (makeImage value))
-          self.nixosConfigurations;
-
-        formatter = pkgs.nixfmt;
-      }));
+      hydraJobs = allSystems.packages.x86_64-linux.base.vm;
+    } // allSystems;
 }

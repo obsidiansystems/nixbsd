@@ -19,12 +19,14 @@
         };
       forAllSystems = f: lib.genAttrs lib.systems.flakeExposed (system: f (makePkgs system));
     in
-    {
+    rec {
       formatter = forAllSystems (pkgs: pkgs.nixfmt-rfc-style);
       packages = forAllSystems (pkgs: rec {
         demo = pkgs.callPackage ./demo.nix { };
         default = demo;
       });
+
+      hydraJobs = packages.x86_64-linux;
     };
 
 }

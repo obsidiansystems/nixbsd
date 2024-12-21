@@ -1,4 +1,4 @@
-let pkgs = import ./nixpkgs { system = "x86_64-linux"; crossSystem.config = "x86_64-openbsd"; };
+let pkgs = import ./nixpkgs {};
 in {
-  inherit (pkgs.openbsd) sys stand;
+  inherit (pkgs.pkgsCross.x86_64-openbsd.openbsd) sys stand;
 }

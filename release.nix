@@ -1,5 +1,5 @@
-let pkgs = import ./nixpkgs { system = "x86_64-linux"; crossSystem.config = "x86_64-openbsd"; };
+let pkgs = import ./nixpkgs {};
 in {
-  nix = pkgs.pkgsStatic.nixVersions.nix_2_24;
-  inherit (pkgs) tailscale;
+  nix = pkgs.pkgsCross.x86_64-openbsd.pkgsStatic.nixVersions.nix_2_24;
+  inherit (pkgs.pkgsCross.x86_64-openbsd) tailscale;
 }

@@ -1,4 +1,4 @@
-{ config, lib, lixFlake ? null, mini-tmpfiles-flake ? null, ... }:
+{ config, lib, mini-tmpfiles-flake ? null, ... }:
 with lib; {
   # TODO: @artemist remove when support is upstream
   # Also remove specialArgs and input changes in flake

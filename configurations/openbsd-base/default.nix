@@ -21,6 +21,8 @@
     pkgs.neofetch
   ];
 
+  services.sshd.enable = true;
+
   virtualisation.vmVariant.virtualisation.diskImage = "./${config.system.name}.qcow2";
 
   xdg.mime.enable = false;

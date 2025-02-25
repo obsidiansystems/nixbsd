@@ -38,15 +38,15 @@
       "locked": {
         "lastModified": 1739558165,
         "narHash": "sha256-jPwGmVFVUJ5NXyWelUD3UlChl30TaMbSBv2RoqJNjQY=",
-        "owner": "nixos-bsd",
-        "repo": "nixpkgs",
+        "owner": "obsidiansystems",
+        "repo": "bsd-nixpkgs",
         "rev": "0ec59fa2cc288df216bbf7d28521f5db274696ba",
         "type": "github"
       },
       "original": {
-        "owner": "nixos-bsd",
-        "ref": "nixbsd-dev-new",
-        "repo": "nixpkgs",
+        "owner": "obsidiansystems",
+        "ref": "openbsd-phase6",
+        "repo": "bsd-nixpkgs",
         "type": "github"
       }
     },

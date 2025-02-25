@@ -1,6 +1,6 @@
 {
   inputs = {
-    nixpkgs.url = "github:nixos-bsd/nixpkgs/nixbsd-dev-new";
+    nixpkgs.url = "github:obsidiansystems/bsd-nixpkgs/openbsd-phase6";
     mini-tmpfiles = {
       url = "github:nixos-bsd/mini-tmpfiles";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -10,12 +10,10 @@
 
   nixConfig = {
     extra-substituters = [
-      "https://nixcache.reflex-frp.org" 
-      "https://attic.mildlyfunctional.gay/nixbsd"
+      "https://nixcache.reflex-frp.org"
     ];
     extra-trusted-public-keys = [
       "ryantrinkle.com-1:JJiAKaRv9mWgpVAz8dwewnZe0AzzEAzPkagE9SP5NWI="
-      "nixbsd:gwcQlsUONBLrrGCOdEboIAeFq9eLaDqfhfXmHZs1mgc="
     ];
   };
 

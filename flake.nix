@@ -1,6 +1,6 @@
 {
   inputs = {
-    nixpkgs.url = "github:obsidiansystems/bsd-nixpkgs/nixbsd-dev";
+    nixpkgs.url = "github:obsidiansystems/bsd-nixpkgs/dg/nixbsd-dev";
     mini-tmpfiles = {
       url = "github:nixos-bsd/mini-tmpfiles";
       inputs.nixpkgs.follows = "nixpkgs";

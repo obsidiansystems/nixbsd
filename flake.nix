@@ -37,6 +37,7 @@
               config.nixpkgs.buildPlatform = buildPlatform;
             }];
           };
+
         in extended.config.system.build // {
           # appease `nix flake show`
           type = "derivation";
@@ -49,6 +50,11 @@
             rootPaths = [ extended.config.system.build.vm.drvPath ];
           };
           inherit (extended) pkgs config;
+
+          imgImage = extended.pkgs.buildPackages.runCommandNoCC "qcow2-to-raw" {} ''
+            mkdir -p $out
+            ${extended.pkgs.buildPackages.qemu-utils}/bin/qemu-img convert ${extended.config.system.build.systemImage}/${extended.config.system.build.systemImage.filename} $out/disk.img
+            '';
         };
     in {
       lib.nixbsdSystem = args:

@@ -23,12 +23,19 @@ in
         {
           freebsd = pkgs.freebsd.sys;
           openbsd = pkgs.openbsd.sys;
+          # PLACEHOLDER: nixpkgs has no illumos kernel yet. `pkgs.illumos.sys` is
+          # only the uts/common/sys headers, not `unix`. Until `pkgs.illumos.unix`
+          # exists, set `boot.kernel.enable = false` or override this option.
+          solaris =
+            pkgs.illumos.unix
+              or (throw "The illumos kernel (unix) is not packaged in nixpkgs yet; set boot.kernel.package, or boot.kernel.enable = false.");
         }
         .${pkgs.stdenv.hostPlatform.parsed.kernel.name};
       defaultText = literalExpression ''
         {
           freebsd = pkgs.freebsd.sys;
           openbsd = pkgs.openbsd.sys;
+          solaris = pkgs.illumos.unix;
         }.''${pkgs.stdenv.hostPlatform.parsed.kernel.name};
       '';
       type = types.package;

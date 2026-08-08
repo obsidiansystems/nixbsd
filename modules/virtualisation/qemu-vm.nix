@@ -413,7 +413,15 @@ in
     virtualisation.rootDevice = mkOption {
       type = types.nullOr types.path;
       default =
-        if pkgs.stdenv.hostPlatform.isOpenBSD then "/dev/sd0a" else "/dev/gpt/${rootFilesystemLabel}";
+        if pkgs.stdenv.hostPlatform.isOpenBSD then
+          "/dev/sd0a"
+        # PLACEHOLDER: illumos has no GEOM labels; disks are /dev/dsk/cNtNdNsN.
+        # The controller number depends on the qemu disk controller in use and
+        # has not been verified against a booting illumos VM.
+        else if pkgs.stdenv.hostPlatform.isIllumos then
+          "/dev/dsk/c1t0d0s0"
+        else
+          "/dev/gpt/${rootFilesystemLabel}";
       defaultText = literalExpression "/dev/gpt/${rootFilesystemLabel}";
       example = "/dev/gpt/nixos";
       description = ''

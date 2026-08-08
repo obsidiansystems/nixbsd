@@ -21,5 +21,11 @@ else if hostPlatform.isOpenBSD then
     ./system/boot/loader/stand-openbsd
     ./system/boot/init/portable/openbsd.nix
   ]
+else if hostPlatform.isIllumos then
+  [
+    ./system/boot/init/portable/illumos.nix
+    ./system/boot/loader/stand-illumos
+    ./virtualisation/zones.nix
+  ]
 else
   throw "Unsupported target platform ${hostPlatform.system}"

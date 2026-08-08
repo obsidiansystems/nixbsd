@@ -147,6 +147,12 @@ in
         {
           freebsd = pkgs.pkgsStatic.freebsd.init;
           openbsd = pkgs.pkgsStatic.openbsd.init;
+          # PLACEHOLDER: illumos' init (usr/src/cmd/init) is not packaged. The
+          # kernel takes its init from the `init-path` boot property
+          # (uts/common/os/main.c), so for bring-up any static binary will do.
+          solaris =
+            pkgs.pkgsStatic.illumos.init
+              or (throw "illumos init is not packaged in nixpkgs yet; set system.init explicitly.");
         }
         .${pkgs.stdenv.hostPlatform.parsed.kernel.name};
       description = ''

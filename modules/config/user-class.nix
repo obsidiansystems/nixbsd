@@ -10,6 +10,8 @@ let
     {
       freebsd = "${pkgs.freebsd.cap_mkdb}/bin/cap_mkdb";
       openbsd = "${pkgs.openbsd.cap_mkdb}/bin/cap_mkdb";
+      # illumos has no login.conf(5)/cap_mkdb(8) at all.
+      solaris = "/no-cap_mkdb-on-illumos";
     }
     .${pkgs.stdenv.hostPlatform.parsed.kernel.name};
 

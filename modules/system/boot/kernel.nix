@@ -68,6 +68,7 @@ in
         {
           freebsd = "${config.system.moduleEnvironment}/kernel/kernel";
           openbsd = "${cfg.package}/bsd";
+          solaris = "${cfg.package}/platform/i86pc/kernel/amd64/unix";
         }
         .${pkgs.stdenv.hostPlatform.parsed.kernel.name};
       defaultText = literalExpression ''
@@ -86,6 +87,7 @@ in
         {
           freebsd = "${config.system.moduleEnvironment}/kernel";
           openbsd = "/not-supported";
+          solaris = "${cfg.package}/kernel";
         }
         .${pkgs.stdenv.hostPlatform.parsed.kernel.name};
       defaultText = literalExpression ''

@@ -197,6 +197,9 @@ let
           bash
           tosyslog
         ];
+        # PLACEHOLDER: no illumos userland is packaged, so there are no
+        # BSD-style helpers for the activation script to reach for.
+        solaris = [ ];
       }
       .${pkgs.stdenv.hostPlatform.parsed.kernel.name}
     );

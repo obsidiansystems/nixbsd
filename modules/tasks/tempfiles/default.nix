@@ -58,6 +58,8 @@ in
           {
             freebsd = pkgs.freebsd.mtree;
             openbsd = pkgs.openbsd.mtree;
+            # PLACEHOLDER: illumos mtree is not packaged.
+            solaris = pkgs.emptyDirectory;
           }
           .${pkgs.stdenv.hostPlatform.parsed.kernel.name};
         description = ''

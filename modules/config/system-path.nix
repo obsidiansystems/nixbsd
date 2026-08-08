@@ -104,6 +104,9 @@ let
         pkgs.openbsd.mt
         pkgs.openbsd.ps
       ];
+      # PLACEHOLDER: nixpkgs has no illumos userland beyond libc and the
+      # kernel, so there is nothing OS-specific to add here yet.
+      solaris = [ ];
     }
     .${pkgs.stdenv.hostPlatform.parsed.kernel.name}
   );
@@ -119,6 +122,7 @@ let
         "freebsd.pciconf"
       ];
       openbsd = [ ];
+      solaris = [ ];
     }
     .${pkgs.stdenv.hostPlatform.parsed.kernel.name};
   defaultPackages = map (

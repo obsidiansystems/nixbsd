@@ -310,6 +310,8 @@ tem partition but the drive layout is asking for it!"
     {
       freebsd = freebsdRootPartition;
       openbsd = openbsdDataPartition;
+      # illumos boots off an ISO for now, not a partitioned data disk.
+      solaris = null;
     }
     .${pkgs.stdenv.hostPlatform.parsed.kernel.name};
 

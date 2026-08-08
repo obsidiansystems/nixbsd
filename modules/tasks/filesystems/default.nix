@@ -282,6 +282,7 @@ in
         {
           freebsd = "50%";
           openbsd = "512m";
+          solaris = "50%";
         }
         .${pkgs.stdenv.hostPlatform.parsed.kernel.name};
       example = "256m";
@@ -297,6 +298,7 @@ in
         {
           freebsd = "25%";
           openbsd = "256m";
+          solaris = "25%";
         }
         .${pkgs.stdenv.hostPlatform.parsed.kernel.name};
       example = "256m";
@@ -352,6 +354,8 @@ in
           pkgs.openbsd.mount_ffs
           pkgs.openbsd.mount_msdos
         ];
+        # PLACEHOLDER: no illumos mount helpers are packaged.
+        solaris = [ ];
       }
       .${pkgs.stdenv.hostPlatform.parsed.kernel.name};
 
@@ -366,6 +370,7 @@ in
           pkgs.openbsd.mount
           pkgs.openbsd.umount
         ];
+        solaris = [ ];
       }
       .${pkgs.stdenv.hostPlatform.parsed.kernel.name};
 
@@ -405,6 +410,10 @@ in
             "-m0755"
             "-s${config.boot.runSize}"
           ];
+          solaris = [
+            "mode=0755"
+            "size=${config.boot.runSize}"
+          ];
         }
         .${pkgs.stdenv.hostPlatform.parsed.kernel.name};
       };
@@ -441,6 +450,7 @@ in
         ++ {
           freebsd = [ freebsd.mount ];
           openbsd = [ openbsd.mount ];
+          solaris = [ ];
         }
         .${pkgs.stdenv.hostPlatform.parsed.kernel.name};
       bsdUtils = true;

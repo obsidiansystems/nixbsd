@@ -51,6 +51,8 @@ in
         {
           freebsd = "${pkgs.freebsd.sysctl}/bin/sysctl";
           openbsd = "${pkgs.openbsd.sysctl}/bin/sysctl";
+          # illumos has no sysctl(8); /etc/system is the rough analogue.
+          solaris = "/no-sysctl-on-illumos";
         }
         .${pkgs.stdenv.hostPlatform.parsed.kernel.name};
     in

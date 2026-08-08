@@ -115,6 +115,9 @@ in
   "${extPath}/config/xdg/icons.nix"
   "${extPath}/config/xdg/menus.nix"
   "${extPath}/config/xdg/portal.nix"
+  # portal.nix sets programs.fuse.userAllowOther, so its module has to come
+  # along too.
+  "${extPath}/programs/fuse.nix"
   ./services/x11/hardware/libinput.nix
   ./services/devd.nix
   ./services/desktops/seatd.nix

@@ -70,9 +70,9 @@
 
   # `system.build.illumosImage` / `system.build.vm` -- see
   # modules/system/boot/illumos-boot-image.nix -- build and boot today.
-  # `system.build.toplevel` does not, and will not for a long while: it wants
-  # bash, coreutils, curl, git and nix cross-compiled for illumos, and nixpkgs
-  # has libc and the kernel and nothing else.
+  # They boot to user mode: init is exec'd and runs. `system.build.toplevel`
+  # evaluates but does not build yet -- it still wants `bashInteractive` and
+  # `coreutils` cross-compiled for illumos.
   virtualisation.vmVariant = {
     virtualisation.diskImage = "./${config.system.name}.qcow2";
     # dboot_startkern.c calls bcons_init() before anything else, so a serial

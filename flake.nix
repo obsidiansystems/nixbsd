@@ -1,6 +1,11 @@
 {
   inputs = {
-    nixpkgs.url = "https://channels.nixos.org/nixos-unstable-small/nixexprs.tar.xz";
+    # The illumos cross-compilation work lives on this branch: the
+    # `pkgs/os-specific/illumos` package set (kernel, libc, ld.so.1,
+    # libsocket/libnsl/libdl/libnvpair), the illumos GCC fork, and the
+    # `isIllumos` platform predicates. The illumos configurations here cannot
+    # be evaluated against a plain nixpkgs until that lands upstream.
+    nixpkgs.url = "github:Ericson2314/nixpkgs/illumos";
     cppnix = {
       url = "github:nixos/nix";
       inputs.nixpkgs.follows = "nixpkgs";

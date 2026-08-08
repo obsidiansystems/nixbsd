@@ -83,6 +83,7 @@ in
   ./system/boot/init/freebsd-rc.nix
   ./system/boot/init/openbsd-rc.nix
   ./system/boot/kernel.nix
+  ./system/boot/illumos-boot-image.nix
   ./system/boot/initmd.nix
   ./system/boot/linux.nix
   ./system/boot/loader/efi.nix

@@ -15,15 +15,27 @@
   # themselves, still win.
   nixpkgs.buildPlatform = lib.mkDefault "x86_64-linux";
 
-  # PLACEHOLDER: there is no illumos kernel package (`unix`) in nixpkgs yet, so
-  # nothing here is buildable end-to-end. `pkgs.illumos.sys` is only the
-  # uts/common/sys headers. Everything below exists so the module tree
-  # evaluates and so the plumbing is in place the moment `unix` lands.
-  boot.kernel.enable = false;
+  # `pkgs.illumos.unix` is the cross-built i86pc kernel. It boots as far as
+  # module loading today; see pkgs/os-specific/illumos/boot-qemu.sh in nixpkgs.
+  boot.kernel.enable = true;
 
   # The illumos boot loader (usr/src/boot, a FreeBSD loader fork) is not
-  # packaged either; see modules/system/boot/loader/stand-illumos.
+  # packaged; we multiboot the kernel from GRUB instead, exactly as
+  # boot-qemu.sh does.
   boot.loader.stand-illumos.enable = false;
+
+  # PLACEHOLDER: nixpkgs packages no illumos userland at all -- no login,
+  # passwd, su, syslogd, devd, mtree, sysctl, mount helpers, rc scripts. Every
+  # module below defaults to a FreeBSD (or OpenBSD) binary, which is not merely
+  # unbuildable here, it fails `meta.platforms` at *evaluation* time. Turn them
+  # off until there is something illumos-native to point them at.
+  programs.passwd.enable = false;
+  programs.su.enable = false;
+  services.devd.enable = false;
+  services.tempfiles.useDefaultSpecs = false;
+  services.tempfiles.specs = [ ];
+  security.sudo.enable = false;
+  services.sshd.enable = false;
 
   users.users.root.initialPassword = "toor";
 
@@ -32,11 +44,15 @@
     fsType = "ufs";
   };
 
+  # `system.build.illumosImage` / `system.build.vm` -- see
+  # modules/system/boot/illumos-boot-image.nix -- build and boot today.
+  # `system.build.toplevel` does not, and will not for a long while: it wants
+  # bash, coreutils, curl, git and nix cross-compiled for illumos, and nixpkgs
+  # has libc and the kernel and nothing else.
   virtualisation.vmVariant = {
     virtualisation.diskImage = "./${config.system.name}.qcow2";
     # dboot_startkern.c calls bcons_init() before anything else, so a serial
-    # console gives output from the very first line of kernel C code. Nothing
-    # boots yet, but this is the shape the VM target should have.
+    # console gives output from the very first line of kernel C code.
     virtualisation.graphics = false;
   };
 

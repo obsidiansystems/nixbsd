@@ -37,6 +37,30 @@
   security.sudo.enable = false;
   services.sshd.enable = false;
 
+  # `system.build.toplevel` otherwise drags in bash, coreutils, curl, git, nix,
+  # dhcpcd, fcron, nano and fontconfig, all cross-compiled for illumos. Almost
+  # none of that builds yet, and waiting for all of it keeps the toplevel path
+  # unreachable indefinitely. Cut it to the smallest set that could plausibly
+  # work, so `toplevel` becomes reachable when a handful of packages land
+  # rather than when the whole tree does. With this, `system.build.toplevel`
+  # *evaluates*; building it is still gated on the userland port.
+  #
+  # `coreutils` and not `coreutils-full`: the latter links openssl, and
+  # openssl's target table (pkgs/development/libraries/openssl/default.nix)
+  # keys on `hostPlatform.system`, where it has `x86_64-solaris` but not
+  # `x86_64-solaris2.11`, so it throws "Not sure what configuration to use"
+  # during evaluation.
+  environment.requiredPackages = lib.mkForce [
+    pkgs.bashInteractive
+    pkgs.coreutils
+  ];
+  environment.defaultPackages = lib.mkForce [ ];
+  networking.dhcpcd.enable = false;
+  networking.useDHCP = false;
+  nix.enable = false;
+  services.fcron.enable = false;
+  fonts.fontconfig.enable = false;
+
   users.users.root.initialPassword = "toor";
 
   fileSystems."/" = {

@@ -155,6 +155,23 @@ in
         '';
       };
 
+      requiredPackages = mkOption {
+        type = types.listOf types.package;
+        default = requiredPackages;
+        defaultText = literalMD "the GNU/Nix base userland, see `modules/config/system-path.nix`";
+        example = [ ];
+        description = ''
+          Packages assumed to be present on any system, unconditionally added
+          to {option}`environment.systemPackages`.
+
+          Overridable mainly for ports where most of this does not
+          cross-compile yet: on illumos, for instance, this list is what makes
+          {option}`system.build.toplevel` depend on curl, git and nix. Removing
+          entries makes the system unusable in the ordinary way, but it lets a
+          port be brought up incrementally rather than all at once.
+        '';
+      };
+
       defaultPackages = mkOption {
         type = types.listOf types.package;
         default = defaultPackages;
@@ -226,7 +243,7 @@ in
 
   config = {
 
-    environment.systemPackages = requiredPackages ++ config.environment.defaultPackages;
+    environment.systemPackages = config.environment.requiredPackages ++ config.environment.defaultPackages;
 
     environment.pathsToLink = [
       "/bin"

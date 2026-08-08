@@ -147,12 +147,14 @@ in
         {
           freebsd = pkgs.pkgsStatic.freebsd.init;
           openbsd = pkgs.pkgsStatic.openbsd.init;
-          # PLACEHOLDER: illumos' init (usr/src/cmd/init) is not packaged. The
-          # kernel takes its init from the `init-path` boot property
-          # (uts/common/os/main.c), so for bring-up any static binary will do.
-          solaris =
-            pkgs.pkgsStatic.illumos.init
-              or (throw "illumos init is not packaged in nixpkgs yet; set system.init explicitly.");
+          # PLACEHOLDER: illumos' real init (usr/src/cmd/init) links against
+          # -lpam -lbsm -lcontract -lscf -- PAM, BSM, the contract filesystem's
+          # library and SMF's repository client -- and none of those is ported.
+          # The kernel takes its init from the `init-path` boot property
+          # (uts/common/os/main.c), so any static binary is enough to
+          # demonstrate that it reached user mode; `init-stub` is a freestanding
+          # one that writes to the console and powers the machine off.
+          solaris = pkgs.illumos.init or pkgs.illumos.init-stub;
         }
         .${pkgs.stdenv.hostPlatform.parsed.kernel.name};
       description = ''

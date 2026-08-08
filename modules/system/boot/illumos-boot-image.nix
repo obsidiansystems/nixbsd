@@ -92,6 +92,13 @@ in
 
 
   config = mkIf isIllumos {
+    # main.c's `init-path` boot property defaults to /sbin/init, and until
+    # there is a real root filesystem the boot archive *is* the root, so the
+    # binary has to be in here. `system.init` is a placeholder stub -- see the
+    # note on that option in system/activation/top-level.nix.
+    boot.illumos.bootArchive.extraFiles."sbin/init" =
+      lib.mkDefault "${config.system.init}/sbin/init";
+
     system.build.bootArchive =
       pkgs.runCommand "illumos-boot-archive"
         {
@@ -143,6 +150,9 @@ in
             lib.mapAttrsToList (name: path: ''
               mkdir -p "ba/$(dirname ${lib.escapeShellArg name})"
               cp -L ${lib.escapeShellArg path} ba/${lib.escapeShellArg name}
+              # cpio -H odc records the mode, and exec_common() will not run a
+              # file the mode says is not executable.
+              chmod 755 ba/${lib.escapeShellArg name}
             '') cfg.bootArchive.extraFiles
           )}
 

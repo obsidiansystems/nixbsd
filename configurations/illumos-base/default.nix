@@ -7,6 +7,14 @@
 {
   nixpkgs.hostPlatform = "x86_64-unknown-solaris2.11";
 
+  # illumos must be cross-compiled: unlike the BSDs, nixpkgs has no native
+  # illumos stdenv bootstrap, so letting buildPlatform default to hostPlatform
+  # sends the bootstrap into an infinite recursion (bashInteractive -> bison ->
+  # help2man -> gettext -> bash) long before any derivation is produced.
+  # mkDefault so the cross entry points in flake.nix, which set buildPlatform
+  # themselves, still win.
+  nixpkgs.buildPlatform = lib.mkDefault "x86_64-linux";
+
   # PLACEHOLDER: there is no illumos kernel package (`unix`) in nixpkgs yet, so
   # nothing here is buildable end-to-end. `pkgs.illumos.sys` is only the
   # uts/common/sys headers. Everything below exists so the module tree

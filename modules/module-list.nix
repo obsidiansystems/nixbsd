@@ -85,6 +85,7 @@ in
   ./system/boot/init/smf.nix
   ./system/boot/kernel.nix
   ./system/boot/illumos-boot-image.nix
+  ./system/boot/illumos-init.nix
   ./system/boot/initmd.nix
   ./system/boot/linux.nix
   ./system/boot/loader/efi.nix

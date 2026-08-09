@@ -14,6 +14,17 @@ let
 in
 {
   options = {
+    services.tempfiles.enable = mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        Whether to run mini-tmpfiles. Turn it off on platforms where it is not
+        packaged: it has no illumos build, and its `meta.platforms` refuses to
+        *evaluate* rather than merely failing to build, so a configuration that
+        never uses it still cannot be instantiated.
+      '';
+    };
+
     systemd.tmpfiles.rules = mkOption {
       type = types.listOf types.str;
       default = [ ];
@@ -151,7 +162,7 @@ in
     };
   };
 
-  config = {
+  config = mkIf config.services.tempfiles.enable {
     #systemd.additionalUpstreamSystemUnits = [
     #  "systemd-tmpfiles-clean.service"
     #  "systemd-tmpfiles-clean.timer"

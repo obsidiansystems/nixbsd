@@ -111,6 +111,21 @@ in
       '';
     };
 
+    bootArchive.files = mkOption {
+      type = types.attrsOf types.lines;
+      default = { };
+      example = lib.literalExpression ''{ "etc/hosts" = "127.0.0.1 localhost\n"; }'';
+      description = ''
+        Plain files to write into the archive, as content keyed by path (no
+        leading slash).
+
+        Written as real files rather than as symlinks into the store: the
+        name-service switch has to work before anything has proved the store
+        is reachable, and a real file does not go through Rock Ridge's symlink
+        records.
+      '';
+    };
+
     bootArchive.mountPoints = mkOption {
       type = types.listOf types.str;
       default = [
@@ -211,6 +226,82 @@ in
       "run/current-system" = "${config.system.build.toplevel}";
     };
 
+    # The name-service switch, and the files it switches to.
+    #
+    # libc turns every getpwnam()/getgrnam()/gethostbyname() into a dlopen() of
+    # a backend named here -- "nss_%s.so.%d", see
+    # lib/libc/port/gen/nss_deffinder.c -- and `files` is the only backend
+    # packaged. The file has to exist as well as be correct: with no
+    # nsswitch.conf at all libc falls back to a compiled-in default naming
+    # backends we do not ship, and the lookup then fails in a way that reads as
+    # a missing *user* rather than a missing *plugin*.
+    #
+    # These are `bootArchive.files` rather than `environment.etc` entries on
+    # purpose. environment.etc would stage them as symlinks into the store,
+    # and name resolution is too far down for that: it has to work before
+    # anything has demonstrated the store is readable.
+    boot.illumos.bootArchive.files = {
+      "etc/nsswitch.conf" = ''
+        passwd:     files
+        group:      files
+        shadow:     files
+        hosts:      files
+        ipnodes:    files
+        networks:   files
+        protocols:  files
+        rpc:        files
+        ethers:     files
+        netmasks:   files
+        bootparams: files
+        publickey:  files
+        netgroup:   files
+        automount:  files
+        aliases:    files
+        services:   files
+        project:    files
+        auth_attr:  files
+        prof_attr:  files
+        exec_attr:  files
+        user_attr:  files
+      '';
+
+      # root's shell is the staged closure's bash, reachable as /bin/sh through
+      # the `bin` symlink above. uid 0 with home / keeps this independent of
+      # whether /root exists in the archive.
+      "etc/passwd" = ''
+        root:x:0:0:Super-User:/:/bin/sh
+        daemon:x:1:1::/:
+        bin:x:2:2::/usr/bin:
+        sys:x:3:3::/:
+        nobody:x:60001:60001:NFS Anonymous Access User:/:
+        noaccess:x:60002:60002:No Access User:/:
+      '';
+
+      # `*LK*` is illumos' locked-account marker. No hash is invented here:
+      # nothing consumes /etc/shadow yet -- login(1) is not packaged and sshd
+      # is not reachable without a network stack -- and the build host has no
+      # crypt(3) producing illumos' $5$ SHA-256 form, so any hash written now
+      # would be unverifiable.
+      "etc/shadow" = ''
+        root:*LK*:::::::
+        daemon:NP:::::::
+        bin:NP:::::::
+        sys:NP:::::::
+        nobody:*LK*:::::::
+        noaccess:*LK*:::::::
+      '';
+
+      "etc/group" = ''
+        root::0:
+        other::1:
+        bin::2:root,daemon
+        sys::3:root,bin,adm
+        adm::4:root,daemon
+        nobody::60001:
+        noaccess::60002:
+      '';
+    };
+
     system.build.bootArchive =
       pkgs.runCommand "illumos-boot-archive"
         {
@@ -243,6 +334,14 @@ in
 
           mkdir -p ${lib.concatMapStringsSep " " (d: "ba/${lib.escapeShellArg d}") cfg.bootArchive.mountPoints}
           : >ba/etc/dfs/sharetab
+
+          ${lib.concatStringsSep "\n" (
+            lib.mapAttrsToList (path: text: ''
+              mkdir -p "$(dirname ba/${lib.escapeShellArg path})"
+              cp ${pkgs.writeText "ba-${builtins.baseNameOf path}" text} ba/${lib.escapeShellArg path}
+              chmod u+w ba/${lib.escapeShellArg path}
+            '') cfg.bootArchive.files
+          )}
 
           # /etc/name_to_major is *not* a source file: uts/intel/os/name_to_major
           # in the gate holds only the four majors pinned by ABI (md, devinfo,

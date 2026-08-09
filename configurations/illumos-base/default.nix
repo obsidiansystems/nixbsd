@@ -32,6 +32,9 @@
   programs.passwd.enable = false;
   programs.su.enable = false;
   services.devd.enable = false;
+  # mini-tmpfiles has no illumos build, and its `meta.platforms` refuses to
+  # evaluate rather than merely failing to build.
+  services.tempfiles.enable = false;
   services.tempfiles.useDefaultSpecs = false;
   services.tempfiles.specs = [ ];
   security.sudo.enable = false;

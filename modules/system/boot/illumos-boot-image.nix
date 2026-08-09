@@ -67,6 +67,9 @@ let
   # install them: they are userland data files, not part of the kernel build's
   # $(ROOT).
   gate = pkgs.illumos.source;
+
+  # The store paths staged into the archive, resolved on the build machine.
+  closure = pkgs.buildPackages.closureInfo { rootPaths = cfg.bootArchive.storePaths; };
 in
 {
   options.boot.illumos = {
@@ -79,6 +82,32 @@ in
         it (no leading slash). The kernel's `init-path` boot property, and
         anything vfs_mountroot() reaches for, has to resolve inside this
         archive until there is a real root filesystem.
+      '';
+    };
+
+    bootArchive.storePaths = mkOption {
+      type = types.listOf types.package;
+      default = [ ];
+      description = ''
+        Store paths whose whole closure is staged into the archive, at their
+        real `/nix/store/...` locations -- `PT_INTERP` and `DT_RUNPATH` are
+        absolute store paths, so nothing else will do.
+
+        This is only affordable because the root hsfs is now mounted with Rock
+        Ridge, so the image carries symlinks and modes: a nix profile stages as
+        a symlink farm rather than materialising every link as a copy of its
+        target.
+      '';
+    };
+
+    bootArchive.symlinks = mkOption {
+      type = types.attrsOf types.str;
+      default = { };
+      example = lib.literalExpression ''{ bin = "''${config.system.path}/bin"; }'';
+      description = ''
+        Symbolic links to create in the archive, as target keyed by link path
+        (no leading slash). Used to give the staged closure the conventional
+        root layout the shell's `PATH` expects.
       '';
     };
 
@@ -157,11 +186,30 @@ in
   config = mkIf isIllumos {
     # main.c's `init-path` boot property defaults to /sbin/init
     # (uts/common/os/main.c:140, zone_initname), and the boot archive is the
-    # root filesystem, so the binary has to be in here. `system.init` is a
-    # placeholder stub -- see the note on that option in
-    # system/activation/top-level.nix.
+    # root filesystem, so the binary has to be in here. See the note on
+    # `system.init` in system/activation/top-level.nix.
     boot.illumos.bootArchive.extraFiles."sbin/init" =
       lib.mkDefault "${config.system.init}/sbin/init";
+
+    # The whole system closure, so that the shell init execs -- an ordinary
+    # dynamically linked illumos program -- can actually run, along with
+    # everything on its `PATH`. `system.init` is listed separately because it
+    # is freestanding and so is not reachable from `toplevel`'s references.
+    boot.illumos.bootArchive.storePaths = lib.mkDefault [
+      config.system.build.toplevel
+      config.system.init
+    ];
+
+    # init-shell's compiled-in environment is PATH=/bin:/usr/bin:/sbin, and
+    # nothing here runs an activation script to populate /run, so give the
+    # staged closure the conventional layout by hand. This is what makes
+    # `nixos-version` -- and everything else in `system.path` -- resolve
+    # without an absolute store path.
+    boot.illumos.bootArchive.symlinks = {
+      "bin" = "${config.system.path}/bin";
+      "usr/bin" = "${config.system.path}/bin";
+      "run/current-system" = "${config.system.build.toplevel}";
+    };
 
     system.build.bootArchive =
       pkgs.runCommand "illumos-boot-archive"
@@ -238,35 +286,59 @@ in
             '') cfg.bootArchive.extraFiles
           )}
 
-          chmod -R u+w ba
+          # The system closure, at its real store paths: PT_INTERP and
+          # DT_RUNPATH are absolute, so nothing else will do. `cp -a` rather
+          # than `cp -RL` -- with Rock Ridge the image carries symlinks, so a
+          # nix profile stays a symlink farm instead of every link becoming a
+          # full copy of its target. That distinction is the whole reason this
+          # is affordable at all.
+          while read -r p; do
+            mkdir -p "ba$(dirname "$p")"
+            cp -a "$p" "ba$p"
+          done <${closure}/store-paths
+          if [ -d ba/nix ]; then chmod -R u+w ba/nix; fi
 
-          # None of these flags is cosmetic.
-          #
-          # -R  Rock Ridge. krtld's standalone reader (common/fs/hsfs.c, which
-          #     parses SUSP/RRIP) uses it, so every module loaded *before* the
-          #     root mount is found under its real lowercase name.
+          # A real illumos root keeps its 64-bit libraries in /lib/amd64, with
+          # /lib/64 as the alias. Two things need this and neither goes through
+          # a runpath: ld.so.1's SONAME is the absolute string
+          # "/lib/amd64/ld.so.1", and libraries like libnsl.so.1 carry no
+          # DT_RUNPATH at all and fall back to the default /lib/64 search path.
+          mkdir -p ba/lib/amd64
+          ln -sfn amd64 ba/lib/64
+          for f in ${pkgs.illumos.libc}/lib/*.so.*; do
+            [ -e "$f" ] || continue
+            ln -sfn "$f" "ba/lib/amd64/$(basename "$f")"
+          done
+          ln -sfn ${pkgs.illumos.libc}/lib/amd64/ld.so.1 ba/lib/amd64/ld.so.1
+
+          ${lib.concatStringsSep "\n" (
+            lib.mapAttrsToList (name: target: ''
+              mkdir -p "ba/$(dirname ${lib.escapeShellArg name})"
+              ln -sfn ${lib.escapeShellArg target} ba/${lib.escapeShellArg name}
+            '') cfg.bootArchive.symlinks
+          )}
+
+          chmod -R u+w ba/etc ba/kernel ba/platform
+
+          # -R  Rock Ridge: real names, POSIX modes and ownership, and symbolic
+          #     links. Both readers use it -- krtld's standalone one
+          #     (common/fs/hsfs.c) for everything loaded before the root mount,
+          #     and the hsfs module afterwards.
           # -D  do not relocate directories deeper than iso9660's eight-level
           #     limit, which platform/i86pc/kernel/drv/amd64/<drv> is right up
-          #     against.
+          #     against, and which /nix/store/<hash>-<name>/... blows past.
           #
-          # After the root mount Rock Ridge is *off*, and this is the trap:
-          # hsfs_mountroot() calls hs_mountfs() with mount_flags = 1, and 1 is
-          # HSFSMNT_NORRIP (uts/common/sys/fs/hsfs_rrip.h:41). A root hsfs is
-          # therefore always read as plain iso9660, so every post-root
-          # modload() sees ISO names. hs_dirlook() upper-cases before comparing,
-          # so directories are fine ("kernel" finds "KERNEL"), but the default
-          # ISO rendering of a file is "CTFS.;1" -- trailing period, version
-          # suffix -- which "CTFS" does not match. Hence:
-          #
-          # -d           omit the trailing period from extensionless names
-          # -N           omit the ";1" version suffix
-          # -iso-level 2 allow names longer than 8.3, for driver_aliases,
-          #              name_to_sysnum, pci_autoconfig and friends
-          #
-          # Without those three the root mounts, the directory walk works, and
-          # then every single modload fails with ENOENT -- which reads like a
-          # corrupt filesystem and is really just filename translation.
-          xorrisofs -R -D -d -N -iso-level 2 -o $out ba
+          # Rock Ridge on the *root* needs illumos' `mount the root hsfs with
+          # Rock Ridge` patch: hsfs_mountroot() otherwise calls hs_mountfs()
+          # with mount_flags = 1, which is HSFSMNT_NORRIP
+          # (uts/common/sys/fs/hsfs_rrip.h:41), so a root hsfs is read as plain
+          # iso9660 whatever the medium carries. Without that patch this needs
+          # `-d -N -iso-level 4` instead -- plain iso9660 renders a file called
+          # `ctfs` as `CTFS.;1` and caps names well below what a store
+          # directory needs -- and even then there are no symlinks and no
+          # modes, so staging a closure would mean materialising every symlink
+          # as a copy of its target.
+          xorrisofs -R -D -o $out ba
         '';
 
     system.build.illumosImage =
@@ -302,15 +374,20 @@ in
         '';
 
     # `mkForce` rather than a `solaris` branch inside qemu-vm.nix: that module
-    # builds a partitioned disk image out of `system.build.toplevel`, which
-    # needs a userland nixpkgs cannot cross-compile for illumos yet. This boots
-    # the kernel and the boot archive alone, which is as far as anything gets
-    # today.
+    # builds a partitioned disk image and boots it off a disk controller, and
+    # illumos has no packaged boot loader and no devfsadm to create the device
+    # nodes one would need. This boots the kernel with the system closure
+    # carried in the boot archive instead.
+    #
+    # The memory default is high because the boot archive is a multiboot
+    # module: GRUB loads the whole thing into RAM and the kernel's ramdisk
+    # device *is* that memory, so the VM needs the archive's full size on top
+    # of everything else.
     system.build.vm = lib.mkForce (
       pkgs.buildPackages.writeShellScriptBin "run-${config.system.name}-vm" ''
         exec ${pkgs.buildPackages.qemu}/bin/qemu-system-x86_64 \
           -display none -no-reboot \
-          -m ${toString (config.virtualisation.memorySize or 4096)} \
+          -m ${toString (config.virtualisation.memorySize or 6144)} \
           -smp ${toString (config.virtualisation.cores or 1)} \
           -cdrom ${config.system.build.illumosImage} \
           -serial mon:stdio "$@"

@@ -14,6 +14,10 @@ let
   tools = pkgs.callPackages ./package.nix {
     nix = config.nix.package.out;
     nixosVersion = config.system.nixos.version;
+    # Defaults to null in package.nix, and a null substitution leaves the
+    # literal `@codeName@` in the output -- which is what `nixos-version`
+    # printed.
+    nixosCodeName = config.system.nixos.codeName;
     nixosRevision = config.system.nixos.revision;
     configurationRevision = config.system.configurationRevision;
   };
@@ -37,9 +41,17 @@ in
       environment.systemPackages = with tools; [
         nixos-install
         nixos-rebuild
-        nixos-version
         nixos-enter
       ];
+    })
+
+    # `nixos-version` is not gated on `nix.enable`, unlike the three above: it
+    # is a shell script that prints strings substituted in at build time and
+    # never invokes nix. Excluding it from a system built without nix -- which
+    # is how a port with no nix of its own has to start out -- costs the most
+    # basic "what am I running" command for no reason.
+    (lib.mkIf (!config.system.disableInstallerTools) {
+      environment.systemPackages = [ tools.nixos-version ];
     })
 
     # These may be used in auxiliary scripts (ie not part of toplevel), so they are defined unconditionally.

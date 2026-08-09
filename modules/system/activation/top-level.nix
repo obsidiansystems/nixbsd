@@ -150,11 +150,13 @@ in
           # PLACEHOLDER: illumos' real init (usr/src/cmd/init) links against
           # -lpam -lbsm -lcontract -lscf -- PAM, BSM, the contract filesystem's
           # library and SMF's repository client -- and none of those is ported.
-          # The kernel takes its init from the `init-path` boot property
-          # (uts/common/os/main.c), so any static binary is enough to
-          # demonstrate that it reached user mode; `init-stub` is a freestanding
-          # one that writes to the console and powers the machine off.
-          solaris = pkgs.illumos.init or pkgs.illumos.init-stub;
+          # `init-shell` is a freestanding stand-in: it finds a console, takes
+          # it as a controlling terminal (setsid + TIOCSCTTY) and execs an
+          # interactive bash, which is enough to get a usable prompt and is a
+          # real exercise of ld.so.1 and the libc composite. `init-stub`, which
+          # prints one line and powers the machine off, is the alternative when
+          # what you want is an unattended boot that terminates.
+          solaris = pkgs.illumos.init or pkgs.illumos.init-shell;
         }
         .${pkgs.stdenv.hostPlatform.parsed.kernel.name};
       description = ''

@@ -25,6 +25,7 @@ else if hostPlatform.isIllumos then
   [
     ./system/boot/init/portable/illumos.nix
     ./system/boot/loader/stand-illumos
+    ./system/service/illumos/system.nix
     ./virtualisation/zones.nix
   ]
 else

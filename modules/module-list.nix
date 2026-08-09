@@ -82,6 +82,7 @@ in
   ./system/boot/init/portable
   ./system/boot/init/freebsd-rc.nix
   ./system/boot/init/openbsd-rc.nix
+  ./system/boot/init/smf.nix
   ./system/boot/kernel.nix
   ./system/boot/illumos-boot-image.nix
   ./system/boot/initmd.nix

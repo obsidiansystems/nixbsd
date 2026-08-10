@@ -18,9 +18,10 @@
 # reason to exist.
 
 let
-  inherit (lib) mkIf mkAfter;
+  inherit (lib) mkIf;
 
   isIllumos = config.nixpkgs.hostPlatform.isSunOS;
+  cfg = config.boot.illumos;
 
   startd = pkgs.illumos.svc-startd or null;
   configd = pkgs.illumos.svc-configd or null;
@@ -32,6 +33,21 @@ let
   consoleShim = pkgs.illumos.init-console or null;
 in
 {
+  options.boot.illumos.debugConsoleInit = lib.mkOption {
+    type = lib.types.bool;
+    default = false;
+    description = ''
+      Run `illumos.init-console` as /sbin/init instead of init itself. It
+      opens the console by device path, puts it on fds 0/1/2 and execs the
+      real init in the same process, so init is still pid 1.
+
+      Only useful for debugging an early failure: init writes its diagnostics
+      to /dev/console and /dev/msglog, neither of which exists until devfsadm
+      is packaged, so without this a crash before init opens anything is
+      completely silent.
+    '';
+  };
+
   config = mkIf isIllumos {
 
     # DEBUGGING: when `illumos.init-console` is available, run it as /sbin/init
@@ -47,7 +63,8 @@ in
     # like a real bug rather than work in progress. Same reason `system.init`
     # is spelled `pkgs.illumos.init or pkgs.illumos.init-shell`.
     boot.illumos.bootArchive.extraFiles."sbin/init" =
-      lib.mkIf (consoleShim != null) (lib.mkForce "${consoleShim}/sbin/init");
+      lib.mkIf (cfg.debugConsoleInit && consoleShim != null)
+        (lib.mkForce "${consoleShim}/sbin/init");
 
     boot.illumos.bootArchive.files = {
 
@@ -77,9 +94,7 @@ in
       # vestigial -- SMF milestones replaced them -- and svc.startd is started
       # from `sysinit`, which runs regardless of run level.
       "etc/inittab" = ''
-        # CONTROL EXPERIMENT -- sysinit entry removed on purpose, to separate
-        # "init cannot run" from "init cannot start svc.startd".
-        # smf::sysinit:/lib/svc/bin/svc.startd
+        smf::sysinit:/lib/svc/bin/svc.startd
       '';
 
       # init calls pam_start("init", ...) in notify_pam_dead(), which closes

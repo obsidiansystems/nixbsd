@@ -81,7 +81,18 @@
     # `getent passwd root` should return a row -- that single command
     # exercises the backend, the switch config and the runpath reasoning.
     pkgs.illumos.getent
-  ];
+  ]
+  # The verb half of SMF: `svcadm enable/disable/restart/refresh/clear/
+  # milestone`. `svccfg` could already import and export manifests, but until
+  # now there was no way to change an instance's administrative state from the
+  # console. Spelled `or null` so this configuration stays evaluable against a
+  # nixpkgs that predates the package.
+  #
+  # Note what it cannot do yet: `svc.configd` currently exits 102 (database
+  # initialization failure), so there is no repository to bind to and every
+  # subcommand will fail against it. Failing with a message is still strictly
+  # better than having no command at all.
+  ++ lib.optional (pkgs.illumos.svcadm or null != null) pkgs.illumos.svcadm;
 
   # `coreutils-full` links openssl, whose target table used to lack
   # `x86_64-solaris2.11` and threw during evaluation. That is fixed, so the

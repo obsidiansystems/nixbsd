@@ -7,6 +7,22 @@
 {
   imports = [ ../illumos-base ];
 
+  # Use nixpkgs' own `nix`, not the one from the `cppnix` flake input.
+  #
+  # `modules/misc/nix-overlay.nix` applies `cppnixFlake.overlays.internal` when
+  # this is on, which replaces `nix` with the flake's build. That build forces
+  # `onetbb`, which has no Solaris support at all -- its malloc proxy is tied to
+  # Linux-only symbol version scripts -- and since the guard is a
+  # `meta.platforms` refusal it fails at *evaluation*, taking out the entire
+  # closure rather than one package.
+  #
+  # nixpkgs' `nix` does not have this problem: its `libblake3` computes
+  # `useTBB ? lib.meta.availableOn stdenv.hostPlatform onetbb`, which is `false`
+  # here, so blake3 drops to single-threaded and nothing references oneTBB.
+  # Note an overlay cannot fix the flake's copy -- it is instantiated
+  # separately, so `nixpkgs.overlays` is invisible to it.
+  nixpkgs.overrideNix = false;
+
   # `illumos-base` is deliberately minimal: it cuts `environment.requiredPackages`
   # to bash and coreutils and turns nix off, so that `system.build.toplevel`
   # becomes reachable as soon as a handful of packages land rather than when the

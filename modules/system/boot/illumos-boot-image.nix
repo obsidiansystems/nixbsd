@@ -484,8 +484,14 @@ in
     # of everything else.
     system.build.vm = lib.mkForce (
       pkgs.buildPackages.writeShellScriptBin "run-${config.system.name}-vm" ''
+        # `accel=kvm:tcg` is qemu's own fallback list: use KVM when /dev/kvm is
+        # usable and drop to emulation when it is not, so this stays runnable
+        # on hosts without it. It is worth the trouble -- almost all of boot is
+        # GRUB copying the boot archive out of the ISO, and under TCG that one
+        # phase costs ~71s against ~26s with KVM (76s vs 31s to a shell).
         exec ${pkgs.buildPackages.qemu}/bin/qemu-system-x86_64 \
           -display none -no-reboot \
+          -machine accel=kvm:tcg -cpu max \
           -m ${toString (config.virtualisation.memorySize or 6144)} \
           -smp ${toString (config.virtualisation.cores or 1)} \
           -cdrom ${config.system.build.illumosImage} \

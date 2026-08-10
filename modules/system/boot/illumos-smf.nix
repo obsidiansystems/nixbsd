@@ -160,6 +160,21 @@ in
       '';
     };
 
+    debugShell = mkOption {
+      type = types.bool;
+      default = false;
+      description = ''
+        Run `illumos.init-shell` as /sbin/init instead of the real init, and
+        leave the bootstrap script in the image to be run by hand.
+
+        This exists because with real init there is *no* console prompt by
+        design: /etc/inittab holds one `sysinit` line and nothing else, so a
+        boot that reaches userland and a boot that hangs look identical on the
+        console. With a shell as pid 1 the bootstrap's every step can be run
+        and read individually, which is the only way to tell those two apart.
+      '';
+    };
+
     consoleDevice = mkOption {
       type = types.nullOr types.str;
       default = "/devices/pci@0,0/isa@1/asy@1,3f8:a";
@@ -223,6 +238,28 @@ in
     '';
 
     boot.illumos.bootArchive.files."etc/sock2path.d/nixbsd" = cfg.sock2path;
+
+    # Every generated manifest carries
+    #
+    #   <!DOCTYPE service_bundle SYSTEM '/usr/share/lib/xml/dtd/service_bundle.dtd.1'>
+    #
+    # and svccfg parses with validation on, so a missing DTD is not a cosmetic
+    # warning -- libxml2 reports "Could not load the external subset" and
+    # svccfg answers "Document is not valid" and imports nothing at all. That
+    # is a silent failure by the time startd sees it: the repository is merely
+    # empty, which is indistinguishable from never having been populated.
+    # `cmd/svc/dtd/service_bundle.dtd.1` in the gate is the file, installed to
+    # this path by `cmd/svc/dtd/Makefile`.
+    boot.illumos.bootArchive.files."usr/share/lib/xml/dtd/service_bundle.dtd.1" =
+      builtins.readFile "${pkgs.illumos.source}/usr/src/cmd/svc/dtd/service_bundle.dtd.1";
+
+    boot.illumos.bootArchive.extraFiles."sbin/init" =
+      lib.mkIf (cfg.debugShell && pkgs.illumos ? init-shell)
+        (lib.mkForce "${pkgs.illumos.init-shell}/sbin/init");
+
+    # The bootstrap is reachable by name from the debug shell, not only
+    # through /etc/inittab.
+    boot.illumos.bootArchive.symlinks."lib/svc/bin/smf-bootstrap" = "${bootstrap}";
 
     # `svc:/milestone/single-user:default` is not decoration. can_come_up()
     # (cmd/svc/startd/graph.c:3712) walks a fixed list -- single-user,

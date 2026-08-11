@@ -31,6 +31,11 @@ let
   # spelled `or null`, so the module stays evaluable against a nixpkgs that
   # does not have it yet.
   consoleShim = pkgs.illumos.init-console or null;
+
+  # The console "getty": opens the console by /devices path, pushes ldterm and
+  # ttcompat onto the bare asy(4D) stream, and runs a root shell on it. Same
+  # `or null` spelling, and for the same reason.
+  consoleLogin = pkgs.illumos.console-login or null;
 in
 {
   options.boot.illumos.debugConsoleInit = lib.mkOption {
@@ -75,27 +80,71 @@ in
         CMASK=022
       '';
 
-      # The one entry that matters is `smf`: this is how svc.startd gets
-      # started, and therefore the only route from init to a running service.
+      # Two entries. `smf` is how svc.startd gets started, and therefore the
+      # only route from init to a running service; `co` is the interactive
+      # console, and is what makes a boot something you can type at.
       #
-      # Two departures from cmd/initpkg/inittab, both forced:
+      # Departures from cmd/initpkg/inittab, all forced:
       #
       #   * No `>/dev/msglog 2<>/dev/msglog </dev/console` on the smf line.
       #     Those nodes are created by devfsadm(8), which is not packaged, so
       #     none of them exist -- see the console hunt in init-shell.c. init
       #     does not start a command whose redirections it cannot open, so
-      #     leaving them in means svc.startd never runs at all.
+      #     leaving them in means svc.startd never runs at all. `co` needs no
+      #     redirection either, for a stronger reason: init sets FD_CLOEXEC on
+      #     every descriptor before exec'ing an inittab command
+      #     (cmd/init/init.c, spawn() and boot_init()), so the command starts
+      #     with no open descriptors at all and console-login has to open the
+      #     console for itself regardless.
       #
-      #   * No `ap`/`sp` sysinit lines: they run /sbin/autopush and
-      #     /sbin/soconfig, neither of which is packaged, and a missing
-      #     sysinit command is a per-boot error rather than something fatal.
+      #   * `co` has no counterpart in the gate's inittab at all, and that is
+      #     the interesting part. On a real system the console login is
+      #     `svc:/system/console-login:default` -- cmd/initpkg/inittab says
+      #     outright that inittab is no longer the place for this -- and
+      #     its method runs `ttymon -d /dev/console -m ldterm,ttcompat`. That
+      #     route is closed here: svc.startd runs now, but svc.configd exits
+      #     102 ("database initialization failure") because there is no
+      #     repository for it to open, so startd goes to maintenance mode and
+      #     starts no service whatsoever. A console reachable only through SMF
+      #     is a console you cannot use to debug SMF.
+      #
+      #     So the entry is a pre-SMF-style inittab line, but `sysinit` rather
+      #     than the `co:234:respawn:` an old Solaris inittab would have used.
+      #     Two independent reasons, and both are why console-login exists
+      #     rather than a bare shell:
+      #
+      #       - `respawn` would never fire. init boots with `cur_state = 0`
+      #         ("It's fine to boot up with state as zero, because startd will
+      #         later tell us the real state", init.c:735), state_to_mask(0) is
+      #         0, and spawn_processes() skips every entry whose rstate mask
+      #         does not intersect the current one. So no respawn entry runs
+      #         until svc.startd reports a run level -- which is exactly the
+      #         thing one wants a console in order to debug.
+      #
+      #       - init *waits* for each sysinit entry, and starts svc.startd only
+      #         after all of them. So the command has to return promptly:
+      #         console-login forks a supervisor and lets its parent exit, and
+      #         does the respawning itself. That is also why `co` comes first
+      #         here -- the console is up before svc.startd is even started, so
+      #         a startd that hangs still leaves a usable machine.
+      #
+      #   * Still no `ap`/`sp` sysinit lines: they run /sbin/autopush and
+      #     /sbin/soconfig, neither of which is packaged. Packaging autopush
+      #     plus /etc/iu.ap (`asy -1 0 ldterm ttcompat`) is the *proper* fix
+      #     for the missing line discipline and would let console-login drop
+      #     its private I_PUSH; until then console-login pushes the modules
+      #     itself, as init-shell.c already did.
       #
       # There is deliberately no `initdefault`. On illumos the run levels are
-      # vestigial -- SMF milestones replaced them -- and svc.startd is started
-      # from `sysinit`, which runs regardless of run level.
-      "etc/inittab" = ''
-        smf::sysinit:/lib/svc/bin/svc.startd
-      '';
+      # vestigial -- SMF milestones replaced them -- and both entries here are
+      # `sysinit`, which runs regardless of run level.
+      "etc/inittab" =
+        lib.optionalString (consoleLogin != null) ''
+          co::sysinit:/sbin/console-login
+        ''
+        + ''
+          smf::sysinit:/lib/svc/bin/svc.startd
+        '';
 
       # init calls pam_start("init", ...) in notify_pam_dead(), which closes
       # a PAM session when a utmpx entry goes away, and sulogin(8) would
@@ -116,14 +165,32 @@ in
     # system is /lib/svc/bin. Point that at the packaged binaries rather than
     # copying them, so the store paths their RUNPATHs refer to stay the ones
     # that get staged.
-    boot.illumos.bootArchive.symlinks = mkIf haveSmf {
-      "lib/svc/bin/svc.startd" = "${startd}/lib/svc/bin/svc.startd";
-      "lib/svc/bin/svc.configd" = "${configd}/lib/svc/bin/svc.configd";
-    };
+    boot.illumos.bootArchive.symlinks =
+      {
+        # init does not exec inittab commands directly: every one of them goes
+        # through `execle(SH, "INITSH", "-c", cmd, ...)` with SH the literal
+        # "/sbin/sh" (cmd/init/init.c:493), and so does svc.startd itself, from
+        # startd_run(). Without this the *only* thing that ever happens is
+        #
+        #     Command "/lib/svc/bin/svc.startd" failed to execute.
+        #     errno = 2 (exec of shell failed)
+        #
+        # and even that goes to /dev/console, which does not exist. bash is in
+        # `environment.requiredPackages` for every illumos configuration here,
+        # and provides `sh`.
+        "sbin/sh" = "${config.system.path}/bin/sh";
+      }
+      // lib.optionalAttrs (consoleLogin != null) {
+        "sbin/console-login" = "${consoleLogin}/sbin/console-login";
+      }
+      // lib.optionalAttrs haveSmf {
+        "lib/svc/bin/svc.startd" = "${startd}/lib/svc/bin/svc.startd";
+        "lib/svc/bin/svc.configd" = "${configd}/lib/svc/bin/svc.configd";
+      };
 
-    # svc.startd and svc.configd are reached only through the symlinks above,
-    # so nothing in `toplevel` refers to them and they would not otherwise be
-    # staged.
+    # svc.startd, svc.configd and console-login are reached only through the
+    # symlinks above, so nothing in `toplevel` refers to them and they would
+    # not otherwise be staged.
     #
     # `mkDefault` is load-bearing, not decoration. illumos-boot-image.nix
     # defines this list with `mkDefault`, and NixOS keeps only the
@@ -138,6 +205,7 @@ in
         startd
         configd
       ]
+      ++ lib.optional (consoleLogin != null) consoleLogin
     );
   };
 }

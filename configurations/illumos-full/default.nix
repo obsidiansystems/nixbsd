@@ -81,7 +81,26 @@
     # `getent passwd root` should return a row -- that single command
     # exercises the backend, the switch config and the runpath reasoning.
     pkgs.illumos.getent
-  ];
+  ]
+  # The verb half of SMF: `svcadm enable/disable/restart/refresh/clear/
+  # milestone`. `svccfg` could already import and export manifests, but until
+  # now there was no way to change an instance's administrative state from the
+  # console. Spelled `or null` so this configuration stays evaluable against a
+  # nixpkgs that predates the package.
+  #
+  # Note what it cannot do yet: `svc.configd` currently exits 102 (database
+  # initialization failure), so there is no repository to bind to and every
+  # subcommand will fail against it. Failing with a message is still strictly
+  # better than having no command at all.
+  ++ lib.optional (pkgs.illumos.svcadm or null != null) pkgs.illumos.svcadm
+  # The query half: `svcs`, `svcs -a`, `svcs -l <fmri>`, and `svcs -x`, which
+  # walks the dependency graph backwards from each impaired instance to the
+  # root cause. Built without libzonecfg (a Tier 4 bring-up shim, nixpkgs
+  # patches/0019); the only thing that costs is `svcs -z <zone> -L` log-path
+  # prefixing, which would need zones this system cannot create anyway. Same
+  # configd caveat as above applies -- svcs will report that it cannot reach
+  # the repository rather than report any services.
+  ++ lib.optional (pkgs.illumos.svcs or null != null) pkgs.illumos.svcs;
 
   # `coreutils-full` links openssl, whose target table used to lack
   # `x86_64-solaris2.11` and threw during evaluation. That is fixed, so the

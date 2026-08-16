@@ -33,35 +33,31 @@
   # `illumos-base` is the bisection point: if it still boots, the fault is in
   # what this file adds, not in the kernel, init or the boot archive.
 
-  # `nix.enable` stays **off**, deliberately. The nix module is about running a
-  # daemon: it wants build users and groups, a writable `/nix/var`, and
-  # something to launch `nix-daemon` at boot. None of those exist here --
-  # `svc.startd` is unpackaged so nothing launches services at all, the root
-  # filesystem is read-only hsfs, and `socket(2)` itself lives in `sockfs`,
-  # which is absent from the kernel module list, so even a unix-domain socket
-  # cannot be created yet.
+  # `nix.enable` stays **off**, deliberately -- but no longer for the original
+  # reasons, which have all since been fixed. The module wants build users and
+  # groups and a `/nix/var` it can write to, and the parts of that story that
+  # were missing (nothing to launch services, no sockets, a read-only root) are
+  # not missing any more: SMF runs, `fs/sockfs` is in the kernel module list,
+  # and the root is a writable UFS ramdisk (`boot.illumos.rootfs`).
   #
-  # What we can have today is the *binary* in the image, which is worth having:
-  # nix cross-compiles to 12 illumos-native executables, `PT_INTERP` pointing
-  # at our own `ld.so.1`. Enough for `nix --version` and to poke at, not enough
-  # to build anything.
-  #
-  # Running `nix-daemon` under SMF is the eventual goal; it needs `svc.startd`,
-  # `fs/sockfs` and a writable `/nix/var` first.
+  # What replaces it for now is `init.services.nix-daemon` at the bottom of
+  # this file, which launches the same daemon through the portable init layer
+  # without the module's user/group machinery. Turning the module on properly
+  # is the remaining work.
   environment.systemPackages = [
     pkgs.nix
 
-    # Cross-compiles and is genuinely illumos-native (`sshd` pulls in
-    # libsocket/libnsl/libmd), but it cannot *run* yet: there is no TCP/IP
-    # stack in the kernel module list -- no `sockfs`, so no sockets in
-    # userland at all -- no NIC driver, and qemu is passed no `-nic`. It is
-    # here so the binaries are in the image to poke at, not because ssh works.
+    # Genuinely illumos-native (`sshd` pulls in libsocket/libnsl/libmd) and
+    # started by SMF below. The kernel now has the IP stack and a NIC driver,
+    # and qemu is passed a virtio NIC with a port forward -- what is still
+    # missing is an address on it, since `ifconfig` links libdladm and
+    # libipadm and neither is packaged yet.
     pkgs.openssh
 
     # curl now has GSSAPI, which took packaging `libresolv` so that krb5's
     # `AC_SEARCH_LIBS(res_nsearch, resolv)` could succeed. Same caveat as
-    # openssh: no network stack, so this is a binary you can run `--version`
-    # on rather than a working client.
+    # openssh: the stack is there but nothing has an address, so this reaches
+    # nothing off-box yet.
     pkgs.curl
 
     # These do work today, since they need nothing but libc.
@@ -88,18 +84,19 @@
   # console. Spelled `or null` so this configuration stays evaluable against a
   # nixpkgs that predates the package.
   #
-  # Note what it cannot do yet: `svc.configd` currently exits 102 (database
-  # initialization failure), so there is no repository to bind to and every
-  # subcommand will fail against it. Failing with a message is still strictly
-  # better than having no command at all.
+  # This used to be noted as useless because `svc.configd` exited 102 (database
+  # initialization failure) and there was no repository to bind to. That is
+  # fixed: configd starts, startd builds the graph, and services reach
+  # `online`, so these actually work now.
   ++ lib.optional (pkgs.illumos.svcadm or null != null) pkgs.illumos.svcadm
   # The query half: `svcs`, `svcs -a`, `svcs -l <fmri>`, and `svcs -x`, which
   # walks the dependency graph backwards from each impaired instance to the
   # root cause. Built without libzonecfg (a Tier 4 bring-up shim, nixpkgs
   # patches/0019); the only thing that costs is `svcs -z <zone> -L` log-path
-  # prefixing, which would need zones this system cannot create anyway. Same
-  # configd caveat as above applies -- svcs will report that it cannot reach
-  # the repository rather than report any services.
+  # prefixing, which would need zones this system cannot create anyway.
+  #
+  # `svcs -x` is the first thing to reach for when a service here misbehaves:
+  # it is how the missing-milestone and sulogin-storm problems were found.
   ++ lib.optional (pkgs.illumos.svcs or null != null) pkgs.illumos.svcs;
 
   # `coreutils-full` links openssl, whose target table used to lack
@@ -140,10 +137,13 @@
   # could run. They are folded in here instead: the manifests still get
   # rendered, and now there is an SMF to import them into.
   #
-  # What still does not work is reaching them: the kernel has a NIC and the IP
-  # stack, but `e1000g` attach fails silently before it can be plumbed, so
-  # there is no address to connect to. See `boot.illumos.kernel` notes and
-  # nixpkgs' illumos `unix.nix`.
+  # What still does not work is reaching them. The kernel has the IP stack and
+  # two NIC drivers, and the VM is given a virtio NIC with host port 2222
+  # forwarded to guest 22 -- but nothing assigns an address, because
+  # `ifconfig` links libdladm and libipadm and neither is packaged yet.
+  # (`e1000g` is also built, but its attach(9E) unwinds silently after a
+  # mac_register() that can be seen to succeed, which is why the VM asks for
+  # virtio instead. See nixpkgs' illumos `unix.nix`.)
   services.sshd.enable = lib.mkForce true;
 
   # The host keys have to live somewhere writable. The default paths are under

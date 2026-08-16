@@ -109,4 +109,80 @@
     pkgs.bashInteractive
     pkgs.coreutils
   ];
+
+  # See modules/system/boot/illumos-smf.nix. This is what turns the packaged
+  # svc.startd and svc.configd from binaries in the image into a running init
+  # system: it configures sockets, builds a writable repository under
+  # /etc/svc/volatile, imports `system.build.smfManifests` and exec's startd.
+  #
+  # This lives here rather than in a configuration of its own so that the
+  # `svcs` and `svcadm` installed above have something to talk to. They were
+  # previously in a configuration that ran SMF but shipped no CLI, and in one
+  # that shipped the CLI but never started SMF.
+  boot.illumos.smf.enable = true;
+
+  # With the real init there is no console prompt by design -- /etc/inittab
+  # holds one `sysinit` line -- so a boot that reaches userland and a boot that
+  # hangs look identical. Set this to put a shell on the console instead and
+  # run the bootstrap by hand as /lib/svc/bin/smf-bootstrap:
+  #
+  #     boot.illumos.smf.debugShell = true;
+
+  # sshd and nginx, both as SMF services. `illumos-base` turns sshd off
+  # because for a long time nothing in the userland cross-compiled; openssh
+  # does now, and nginx builds too, so force it back on here. Both render into
+  # the `site/` namespace rather than the OS-delivered `network/ssh`, since
+  # they are not gate-delivered services -- compare usr/src/cmd/ssh/etc/ssh.xml
+  # in illumos-gate for what a hand-written manifest looks like.
+  #
+  # These were three separate configurations (illumos-sshd, illumos-nginx,
+  # illumos-modular) that existed only to render manifests, since none of it
+  # could run. They are folded in here instead: the manifests still get
+  # rendered, and now there is an SMF to import them into.
+  #
+  # What still does not work is reaching them: the kernel has a NIC and the IP
+  # stack, but `e1000g` attach fails silently before it can be plumbed, so
+  # there is no address to connect to. See `boot.illumos.kernel` notes and
+  # nixpkgs' illumos `unix.nix`.
+  services.sshd.enable = lib.mkForce true;
+
+  services.nginx = {
+    enable = true;
+    virtualHosts."localhost" = {
+      default = true;
+      root = ./.;
+    };
+  };
+
+  # NixOS modular services lowered onto SMF, the same way ../modular-test does
+  # for FreeBSD rc. See ../../modules/system/service/illumos/. This is a
+  # different path from `init.services` below -- `system.services` ->
+  # `smf.services` -- and nothing else here exercises it, which is why the
+  # demo survives the folding-in of the old illumos-modular configuration.
+  # Drop it once a real service uses this path.
+  system.services.hello =
+    { config, ... }:
+    {
+      _class = "service";
+
+      process.argv = [
+        "/bin/sh"
+        "-c"
+        "while :; do echo hello from ${config.smf.meta.servicePrefix}; sleep 60; done"
+      ];
+    };
+
+  # The daemon SMF exists to supervise here. Declared through the portable
+  # `init.services` layer, which modules/system/boot/init/portable/illumos.nix
+  # renders into an SMF manifest.
+  init.services.nix-daemon = {
+    description = "Nix build daemon";
+    startCommand = [ "${pkgs.nix}/bin/nix-daemon" ];
+    startType = "foreground";
+    environment = {
+      # /tmp is a directory in the read-only root, not a filesystem; the one
+      # writable tree this early is the kernel's tmpfs on /etc/svc/volatile.
+      TMPDIR = "/etc/svc/volatile/tmp";
+    };
+  };
 }

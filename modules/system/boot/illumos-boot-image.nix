@@ -224,6 +224,25 @@ in
       "bin" = "${config.system.path}/bin";
       "usr/bin" = "${config.system.path}/bin";
       "run/current-system" = "${config.system.build.toplevel}";
+
+      # /dev/null and /dev/zero. Everywhere else in this module devices are
+      # named by their /devices path precisely because there is no devfsadm(8)
+      # to make the /dev links -- but these two cannot be, because the programs
+      # that want them hard-code the name. svc.startd opens /dev/null for every
+      # service it starts and refuses to start any without it:
+      #
+      #     svc.startd: can't connect stdin to /dev/null: No such file or directory
+      #
+      # after which the console loops on "Console login service(s) cannot run /
+      # Requesting System Maintenance Mode".
+      #
+      # The minor nodes come from mm(4D) (`intel/mm` in nixpkgs' `unix.nix`,
+      # declared in common/io/mem.c at 0666), so the link is to devfs and needs
+      # no writable /dev -- which matters, since the root is read-only hsfs.
+      # devfsadm would make exactly these links; this is the two of them that
+      # boot depends on.
+      "dev/null" = "/devices/pseudo/mm@0:null";
+      "dev/zero" = "/devices/pseudo/mm@0:zero";
     };
 
     # The name-service switch, and the files it switches to.
@@ -489,11 +508,23 @@ in
         # on hosts without it. It is worth the trouble -- almost all of boot is
         # GRUB copying the boot archive out of the ISO, and under TCG that one
         # phase costs ~71s against ~26s with KVM (76s vs 31s to a shell).
+        # `model=virtio-net-pci` rather than qemu's default e1000: the kernel
+        # carries both drivers (`intel/vioif` and `intel/e1000g` in nixpkgs'
+        # illumos `unix.nix`), but e1000g's attach(9E) unwinds silently after a
+        # mac_register() we can see succeed, so vioif is the one with a chance
+        # of coming up. Change the model here to test the other path.
+        #
+        # `hostfwd` puts the guest's port 22 on localhost:2222, so that once an
+        # address is plumbed `ssh -p 2222 root@localhost` reaches it. Nothing
+        # plumbs one yet: `ifconfig` links libdladm and libipadm, neither of
+        # which is packaged, so this is the host half of a path whose guest
+        # half is still missing.
         exec ${pkgs.buildPackages.qemu}/bin/qemu-system-x86_64 \
           -display none -no-reboot \
           -machine accel=kvm:tcg -cpu max \
           -m ${toString (config.virtualisation.memorySize or 6144)} \
           -smp ${toString (config.virtualisation.cores or 1)} \
+          -nic user,model=virtio-net-pci,hostfwd=tcp::2222-:22 \
           -cdrom ${config.system.build.illumosImage} \
           -serial mon:stdio "$@"
       ''

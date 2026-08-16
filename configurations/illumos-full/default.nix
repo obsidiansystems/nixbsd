@@ -170,6 +170,28 @@
     }
   ];
 
+  # sshd reads /etc/ssh/sshd_config by name -- the generated start method runs
+  # `sshd` with no `-f` -- and the boot archive stages `bootArchive.files` and
+  # `bootArchive.symlinks` only, not `environment.etc`. So the config the
+  # module generates never reaches the image, and sshd exits 1 on every start:
+  #
+  #     illumos# sshd -t
+  #     /etc/ssh/sshd_config: No such file or directory
+  #
+  # Link them in from the store rather than copying: the system closure is
+  # already in the archive, so this costs nothing but the link. `moduli` comes
+  # along for the same reason -- sshd wants it for diffie-hellman-group-exchange
+  # and complains when it is absent.
+  #
+  # TODO the tidier fix is for the start method to pass `-f`, which would keep
+  # the config in the store where the rest of the configuration lives. That
+  # means touching modules/services/networking/ssh/sshd.nix, which FreeBSD and
+  # OpenBSD share, so it wants testing on those first.
+  boot.illumos.bootArchive.symlinks = {
+    "etc/ssh/sshd_config" = "${config.environment.etc."ssh/sshd_config".source}";
+    "etc/ssh/moduli" = "${config.environment.etc."ssh/moduli".source}";
+  };
+
   services.nginx = {
     enable = true;
     virtualHosts."localhost" = {

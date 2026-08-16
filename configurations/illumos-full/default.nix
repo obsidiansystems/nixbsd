@@ -146,6 +146,30 @@
   # nixpkgs' illumos `unix.nix`.
   services.sshd.enable = lib.mkForce true;
 
+  # The host keys have to live somewhere writable. The default paths are under
+  # /etc/ssh, which is on the read-only hsfs root, so the start method fails
+  # every time and the service lands in maintenance:
+  #
+  #     mkdir: cannot create directory '/etc/ssh': Read-only file system
+  #     Saving key "/etc/ssh/ssh_host_rsa_key" failed: No such file or directory
+  #     [ start + 2.76s Method "start" exited with status 1. ]
+  #
+  # /etc/svc/volatile is the kernel-mounted tmpfs, and the module's `preStart`
+  # already does `mkdir -p` on each key's directory, so pointing the paths
+  # there is enough. Regenerated every boot, which is what a VM with no
+  # persistent storage can offer: expect a host-key warning on reconnect.
+  services.openssh.hostKeys = lib.mkForce [
+    {
+      type = "ed25519";
+      path = "/etc/svc/volatile/ssh/ssh_host_ed25519_key";
+    }
+    {
+      type = "rsa";
+      bits = 4096;
+      path = "/etc/svc/volatile/ssh/ssh_host_rsa_key";
+    }
+  ];
+
   services.nginx = {
     enable = true;
     virtualHosts."localhost" = {

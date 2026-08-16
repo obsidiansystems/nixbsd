@@ -10,21 +10,37 @@
 # This tracks nixpkgs' `pkgs/os-specific/illumos/boot-qemu.sh`, which is the
 # scaffolding this replaces. Everything below is load-bearing.
 #
-# The boot archive is an *iso9660* filesystem image, not an archive format.
-# The archive reaches the kernel as a ramdisk whose block device (/ramdisk:a)
-# is the loaded multiboot module byte for byte -- nothing unpacks it,
-# impl_setup_ddi() (uts/i86pc/os/ddi_impl.c) just hands ramdisk_start /
-# ramdisk_end to drv/ramdisk as its "existing" property -- so it has to *be* a
-# mountable filesystem. cpio is readable only by krtld's bcpio_ops
+# The boot archive is a *filesystem image*, not an archive format. It reaches
+# the kernel as a ramdisk whose block device (/ramdisk:a) is the loaded
+# multiboot module byte for byte -- nothing unpacks it, impl_setup_ddi()
+# (uts/i86pc/os/ddi_impl.c) just hands ramdisk_start / ramdisk_end to
+# drv/ramdisk as its "existing" property -- so it has to *be* something
+# vfs_mountroot() can mount. cpio is readable only by krtld's bcpio_ops
 # (uts/common/krtld/bootrd.c) and has no entry in uts/common/os/vfs_conf.c, so
 # it can never be a root filesystem; the old panic said exactly that ("not a
 # UFS magic number (0x394d0000)", 0x394d being "9M", the head of cpio's 070707
-# magic). Of the four formats bootadm(8) knows, hsfs is the only one
-# synthesisable on a Linux build host: mkfs_ufs is a *target* program, and
-# illumos UFS is not interchangeable with BSD FFS1 where it counts -- struct
-# direct in uts/common/sys/fs/ufs_fsdir.h has a 16-bit d_namlen exactly where
-# FreeBSD's makefs writes a d_type byte plus an 8-bit namlen, so every
-# directory entry would be misread.
+# magic).
+#
+# It is UFS now -- see `boot.illumos.rootfs`. It used to have to be hsfs,
+# because that was the only one of bootadm(8)'s four formats synthesisable on a
+# Linux build host: mkfs_ufs was a target-only program, and illumos UFS is not
+# interchangeable with BSD FFS1 where it counts (struct direct in
+# uts/common/sys/fs/ufs_fsdir.h has a 16-bit d_namlen exactly where FreeBSD's
+# makefs writes a d_type byte plus an 8-bit namlen, so every directory entry
+# would be misread). Both halves of that are now fixed: nixpkgs'
+# `illumos.mkfs-ufs` builds the gate's own mkfs for the build host, and its
+# `-R` option fills the filesystem in, so the format is illumos' by
+# construction. hsfs remains available and is still what to fall back to when
+# bisecting a boot failure.
+#
+# What this does *not* yet buy is a writable root. UFS can be written, unlike
+# hsfs, but ufs_mountroot() sets VFS_RDONLY for ROOT_INIT
+# (uts/common/fs/ufs/ufs_vfsops.c) -- illumos always mounts the root read-only
+# and relies on a later `mount -o remount,rw /` (ROOT_REMOUNT), which upstream
+# drives from svc:/system/filesystem/root and nothing here does yet. So the
+# redirections onto the kernel's tmpfs at /etc/svc/volatile -- sshd's host
+# keys, the SMF repository, /tmp -- are still load-bearing. Removing them is
+# what the remount unblocks.
 #
 # GRUB2 does not pass the kernel path in the multiboot command line, but
 # uts/i86pc/os/fakebop.c:1694 takes the first word of that line as
@@ -174,7 +190,10 @@ in
 
     kernelArgs = mkOption {
       type = types.str;
-      default = "-B console=ttya,input-console=ttya,fstype=hsfs";
+      default = "-B console=ttya,input-console=ttya,fstype=${cfg.rootfs}";
+      defaultText = lib.literalExpression ''
+        "-B console=ttya,input-console=ttya,fstype=''${config.boot.illumos.rootfs}"
+      '';
       description = ''
         Arguments appended to the multiboot command line. Note that
         fakebop.c takes the *first* word of that line as the kernel path, so
@@ -183,6 +202,42 @@ in
         (common/fs/vfs.c) hands to vfs_mountroot(); it defaults to ufs.
       '';
     };
+
+    rootfs = mkOption {
+      type = types.enum [
+        "hsfs"
+        "ufs"
+      ];
+      default = "ufs";
+      description = ''
+        The filesystem the boot archive is made as.
+
+        The archive reaches the kernel as a multiboot module and becomes
+        /ramdisk:a byte for byte, so it has to *be* a mountable filesystem;
+        this chooses which one, and `kernelArgs`' `fstype=` follows it.
+
+        `hsfs` is iso9660, which is what this used before there was any way to
+        make a UFS filesystem on a build host. It is read-only by nature, so
+        the running system has no writable storage at all beyond the kernel's
+        tmpfs on /etc/svc/volatile -- which is why sshd's host keys, the SMF
+        repository and /tmp all have to be redirected there by hand.
+
+        `ufs` is a filesystem that *can* be written, made by
+        `illumos.mkfs-ufs` (illumos' own mkfs(8) built to run on the build
+        host) and filled in by its `-R` option.
+
+        Note "can be": the kernel still mounts the root read-only
+        (ufs_mountroot() sets VFS_RDONLY for ROOT_INIT), so until something
+        performs the `mount -o remount,rw /` that upstream's
+        svc:/system/filesystem/root does, this behaves like hsfs did. The
+        difference is that the remount is now possible at all.
+
+        It also costs more memory than hsfs: the archive is a ramdisk, so the
+        whole image is loaded at boot, and a UFS image is larger than the
+        equivalent ISO.
+      '';
+    };
+
   };
 
   options.system.build = {
@@ -327,7 +382,8 @@ in
           nativeBuildInputs = with pkgs.buildPackages; [
             libisoburn
             gawk
-          ];
+          ]
+          ++ lib.optional (cfg.rootfs == "ufs") pkgs.illumos.mkfs-ufs;
         }
         ''
           mkdir -p ba/etc
@@ -406,10 +462,12 @@ in
 
           # The system closure, at its real store paths: PT_INTERP and
           # DT_RUNPATH are absolute, so nothing else will do. `cp -a` rather
-          # than `cp -RL` -- with Rock Ridge the image carries symlinks, so a
-          # nix profile stays a symlink farm instead of every link becoming a
-          # full copy of its target. That distinction is the whole reason this
-          # is affordable at all.
+          # than `cp -RL`: the image carries symlinks either way -- UFS
+          # natively, hsfs through Rock Ridge -- so a nix profile stays a
+          # symlink farm instead of every link becoming a full copy of its
+          # target. That distinction is the whole reason this is affordable at
+          # all. `cp -a` also keeps hard links within a store path, which both
+          # image formats preserve.
           while read -r p; do
             mkdir -p "ba$(dirname "$p")"
             cp -a "$p" "ba$p"
@@ -438,25 +496,54 @@ in
 
           chmod -R u+w ba/etc ba/kernel ba/platform
 
-          # -R  Rock Ridge: real names, POSIX modes and ownership, and symbolic
-          #     links. Both readers use it -- krtld's standalone one
-          #     (common/fs/hsfs.c) for everything loaded before the root mount,
-          #     and the hsfs module afterwards.
-          # -D  do not relocate directories deeper than iso9660's eight-level
-          #     limit, which platform/i86pc/kernel/drv/amd64/<drv> is right up
-          #     against, and which /nix/store/<hash>-<name>/... blows past.
-          #
-          # Rock Ridge on the *root* needs illumos' `mount the root hsfs with
-          # Rock Ridge` patch: hsfs_mountroot() otherwise calls hs_mountfs()
-          # with mount_flags = 1, which is HSFSMNT_NORRIP
-          # (uts/common/sys/fs/hsfs_rrip.h:41), so a root hsfs is read as plain
-          # iso9660 whatever the medium carries. Without that patch this needs
-          # `-d -N -iso-level 4` instead -- plain iso9660 renders a file called
-          # `ctfs` as `CTFS.;1` and caps names well below what a store
-          # directory needs -- and even then there are no symlinks and no
-          # modes, so staging a closure would mean materialising every symlink
-          # as a copy of its target.
-          xorrisofs -R -D -o $out ba
+          ${
+            if cfg.rootfs == "ufs" then
+              ''
+                # Size the image from the tree. mkfs needs the file to be its
+                # final length up front, since that is what the geometry is
+                # derived from, and UFS wants some slack on top of the data:
+                # inodes, cylinder group metadata, and each file's tail rounded
+                # up to a whole fragment.
+                #
+                # The slack is NOT free, which is why it is this tight. The
+                # archive is a ramdisk -- the whole image is loaded into memory
+                # at boot and GRUB copies every byte of it first -- so
+                # over-sizing costs RAM and boot time directly. Measured
+                # overhead on the current tree is about 8% (a 1.11GB tree left
+                # 493MB free in a 1.7GB image), so a fifth plus 32MB leaves a
+                # comfortable margin without doubling the memory footprint.
+                kb=$(du -sk --apparent-size ba | cut -f1)
+                mb=$(( kb / 1024 * 6 / 5 + 32 ))
+                echo "boot archive tree is ''${kb}KB; making a ''${mb}MB UFS image"
+
+                truncate -s ''${mb}M $out
+                mkfs_ufs -F ufs -R ba $out $(( mb * 2048 ))
+              ''
+            else
+              ''
+                # -R  Rock Ridge: real names, POSIX modes and ownership, and
+                #     symbolic links. Both readers use it -- krtld's standalone
+                #     one (common/fs/hsfs.c) for everything loaded before the
+                #     root mount, and the hsfs module afterwards.
+                # -D  do not relocate directories deeper than iso9660's
+                #     eight-level limit, which
+                #     platform/i86pc/kernel/drv/amd64/<drv> is right up
+                #     against, and which /nix/store/<hash>-<name>/... blows
+                #     past.
+                #
+                # Rock Ridge on the *root* needs illumos' `mount the root hsfs
+                # with Rock Ridge` patch: hsfs_mountroot() otherwise calls
+                # hs_mountfs() with mount_flags = 1, which is HSFSMNT_NORRIP
+                # (uts/common/sys/fs/hsfs_rrip.h:41), so a root hsfs is read as
+                # plain iso9660 whatever the medium carries. Without that patch
+                # this needs `-d -N -iso-level 4` instead -- plain iso9660
+                # renders a file called `ctfs` as `CTFS.;1` and caps names well
+                # below what a store directory needs -- and even then there are
+                # no symlinks and no modes, so staging a closure would mean
+                # materialising every symlink as a copy of its target.
+                xorrisofs -R -D -o $out ba
+              ''
+          }
         '';
 
     system.build.illumosImage =

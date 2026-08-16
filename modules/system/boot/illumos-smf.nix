@@ -134,7 +134,16 @@ let
     # walk is not recursive.
     if [ ! -f ${repository} ]; then
       shopt -s nullglob
-      manifests=(/lib/svc/manifest/*.xml /lib/svc/manifest/*/*.xml)
+      # Three levels, not two: FMRIs nest as deeply as their name does, so
+      # `svc:/system/filesystem/local` lands at
+      # manifest/system/filesystem/local.xml. A two-level glob silently misses
+      # those, and the only symptom is the services that depend on them sitting
+      # offline forever with "Dependency ... is absent".
+      manifests=(
+        /lib/svc/manifest/*.xml
+        /lib/svc/manifest/*/*.xml
+        /lib/svc/manifest/*/*/*.xml
+      )
       SVCCFG_REPOSITORY=${repository} \
       SVCCFG_CONFIGD_PATH=${configd}/lib/svc/bin/svc.configd \
       SVCCFG_DOOR_PATH=${volatile} \
@@ -274,13 +283,87 @@ in
     # which depends on a dozen services none of which are packaged. This is
     # the same thing reduced to its one load-bearing property: a service that
     # exists, is enabled and reaches `online` on its own.
-    smf.services."milestone/single-user" = {
-      type = "milestone";
-      duration = "transient";
-      template.commonName = "single-user milestone";
-      execMethods.start.exec = ":true";
-      execMethods.stop.exec = ":true";
-    };
+    # The same reasoning applies to every *other* milestone a generated
+    # manifest names. `portable/illumos.nix` maps the rc(8) dummy services onto
+    # real FMRIs -- FILESYSTEMS onto svc:/system/filesystem/local, DAEMON and
+    # LOGIN onto svc:/milestone/multi-user, and so on -- and SMF has no notion
+    # of "order against this if it exists": a dependency on an FMRI that is
+    # never delivered simply stays unsatisfied, and the service never comes
+    # online. Observed with `svcs -xv` on a booted system:
+    #
+    #     svc:/site/sshd:default (Secure Shell Daemon)
+    #      State: offline since ...
+    #     Reason: Dependency svc:/milestone/multi-user is absent.
+    #
+    # and likewise filesystem/local for suid-sgid-wrappers and
+    # filesystem/minimal for tempfiles. So deliver all of them, on the same
+    # terms as single-user: a service that exists, is enabled, and reaches
+    # `online` on its own.
+    #
+    # The orderings between them are upstream's (minimal before local,
+    # single-user before multi-user), kept so that a service ordered against
+    # one of these still lands on the right side of the others. They are one
+    # FMRI each, so they do not trip the configd bug that `renderDependency`
+    # works around.
+    #
+    # These are stand-ins. As the real services behind each milestone get
+    # packaged -- mount, devfsadm, the network stack -- the corresponding stub
+    # should be replaced by the genuine article rather than left to shadow it.
+    smf.services =
+      let
+        milestone = commonName: after: {
+          type = "milestone";
+          duration = "transient";
+          template.commonName = commonName;
+          execMethods.start.exec = ":true";
+          execMethods.stop.exec = ":true";
+          dependencies = lib.optionalAttrs (after != null) {
+            after = {
+              grouping = "require_all";
+              restartOn = "none";
+              type = "service";
+              fmris = [ after ];
+            };
+          };
+        };
+      in
+      {
+        "system/filesystem/minimal" = milestone "minimal filesystems" null;
+        "system/filesystem/local" = milestone "local filesystems" "svc:/system/filesystem/minimal";
+        "milestone/single-user" = milestone "single-user milestone" "svc:/system/filesystem/local";
+        "milestone/multi-user" = milestone "multi-user milestone" "svc:/milestone/single-user";
+        "system/identity" = milestone "system identity" null;
+        "network/physical" = milestone "physical network interfaces" null;
+        "milestone/network" = milestone "network milestone" "svc:/network/physical";
+
+        # Not a milestone, and not decoration either: this is what stops the
+        # sulogin retry storm.
+        #
+        # can_come_up() (graph.c:3712) walks `up_svcs[]` -- single-user,
+        # console-login, install-setup, install -- starting at index
+        # `(booting_to_single_user ? 0 : 1)`. Since we do not boot to single
+        # user, index 0 is skipped, so the `milestone/single-user` above can
+        # *never* satisfy it however healthy it is, and console-login is the
+        # first entry actually consulted. With none of the four present,
+        # can_come_up() stays false and sulogin_thread (graph.c:3863) loops on
+        # run_sulogin() forever, printing
+        #
+        #     Console login service(s) cannot run
+        #     Requesting System Maintenance Mode
+        #
+        # That storm is not merely noisy: it burns the single CPU the guest
+        # has, and the service graph crawls behind it -- milestones were
+        # observed taking tens of seconds each to come online, in varying
+        # order between boots.
+        #
+        # The console itself is still provided by /etc/inittab's
+        # `co::sysinit:/sbin/console-login` line (see illumos-init.nix); this
+        # service exists so that startd can see that a console login exists.
+        # When console-login moves into SMF properly -- which is upstream's
+        # arrangement, where inittab carries only the svc.startd line -- this
+        # stub should become the real service rather than sit alongside it.
+        "system/console-login" = milestone "console login" null;
+      };
 
     # /var/run has to be a *symlink* into the writable tmpfs, not the empty
     # read-only directory the default mount-point list creates. The archive

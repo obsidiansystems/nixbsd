@@ -21,33 +21,42 @@ with lib;
 let
   cfg = config.smf;
 
-  esc = escapeXML;
-
-  attr = name: value: optionalString (value != null) " ${name}='${esc (toString value)}'";
+  # XML is built structurally -- see ../../../../lib/xml.nix -- rather than by
+  # pasting strings together. Escaping and quoting then happen in exactly one
+  # place, optional attributes are expressed by passing `null`, and an element
+  # with no children self-closes without anyone having to remember to write it
+  # two different ways.
+  xml = import ../../../../lib/xml.nix { inherit lib; };
+  inherit (xml) elem leaf text;
 
   # <propval>/<property> ------------------------------------------------------
 
-  # `toString true` is "1", which is not a valid SMF boolean.
-  fmtValue = v: if isBool v then boolToString v else toString v;
-
-  renderPropval =
-    indent: name: p:
+  propvalNode =
+    name: p:
     if p.values == null then
-      "${indent}<propval name='${esc name}' type='${p.type}' value='${esc (fmtValue p.value)}'/>\n"
+      leaf "propval" {
+        inherit name;
+        inherit (p) type;
+        inherit (p) value;
+      }
     else
-      ''
-        ${indent}<property name='${esc name}' type='${p.type}'>
-        ${indent}  <${p.type}_list>
-        ${
-          concatMapStrings (v: "${indent}    <value_node value='${esc (fmtValue v)}'/>\n") p.values
-        }${indent}  </${p.type}_list>
-        ${indent}</property>
-      '';
+      elem "property"
+        {
+          inherit name;
+          inherit (p) type;
+        }
+        [
+          (elem "${p.type}_list" { } (map (v: leaf "value_node" { value = v; }) p.values))
+        ];
 
-  renderPropertyGroup = indent: name: pg: ''
-    ${indent}<property_group name='${esc name}' type='${esc pg.type}'>
-    ${concatStrings (mapAttrsToList (renderPropval "${indent}  ") pg.properties)}${indent}</property_group>
-  '';
+  propertyGroupNode =
+    name: pg:
+    elem "property_group"
+      {
+        inherit name;
+        inherit (pg) type;
+      }
+      (mapAttrsToList propvalNode pg.properties);
 
   # <dependency>/<dependent> -------------------------------------------------
 
@@ -75,31 +84,33 @@ let
   # entirely normal.
   splittableGrouping = g: g == "require_all" || g == "optional_all";
 
-  renderDependency =
-    indent: name: d:
+  fmriNodes = fmris: map (f: leaf "service_fmri" { value = f; }) fmris;
+
+  # Returns a *list* of nodes, since one dependency may split into several.
+  dependencyNodes =
+    name: d:
     let
-      one = suffix: f: ''
-        ${indent}<dependency name='${esc (name + suffix)}' grouping='${d.grouping}' restart_on='${d.restartOn}' type='${esc d.type}'>
-        ${indent}  <service_fmri value='${esc f}'/>
-        ${indent}</dependency>
-      '';
+      block =
+        suffix: fmris:
+        elem "dependency" {
+          name = name + suffix;
+          inherit (d) grouping;
+          restart_on = d.restartOn;
+          inherit (d) type;
+        } (fmriNodes fmris);
     in
     if splittableGrouping d.grouping && length d.fmris > 1 then
-      concatStrings (imap0 (i: f: one "-${toString i}" f) d.fmris)
+      imap0 (i: f: block "-${toString i}" [ f ]) d.fmris
     else
-      ''
-        ${indent}<dependency name='${esc name}' grouping='${d.grouping}' restart_on='${d.restartOn}' type='${esc d.type}'>
-        ${
-          concatMapStrings (f: "${indent}  <service_fmri value='${esc f}'/>\n") d.fmris
-        }${indent}</dependency>
-      '';
+      [ (block "" d.fmris) ];
 
-  renderDependent = indent: name: d: ''
-    ${indent}<dependent name='${esc name}' grouping='${d.grouping}' restart_on='${d.restartOn}'>
-    ${
-      concatMapStrings (f: "${indent}  <service_fmri value='${esc f}'/>\n") d.fmris
-    }${indent}</dependent>
-  '';
+  dependentNode =
+    name: d:
+    elem "dependent" {
+      inherit name;
+      inherit (d) grouping;
+      restart_on = d.restartOn;
+    } (fmriNodes d.fmris);
 
   # <method_context> ---------------------------------------------------------
 
@@ -111,94 +122,118 @@ let
     || mc.resourcePool != null
     || mc.environment != { };
 
-  renderMethodContext =
-    indent: mc:
-    optionalString (hasMethodContext mc) (
-      let
-        credential = optionalString (mc.user != null) (
-          "${indent}  <method_credential${attr "user" mc.user}${attr "group" mc.group}"
-          + "${attr "supp_groups" (
-            if mc.supplementaryGroups == [ ] then null else concatStringsSep "," mc.supplementaryGroups
-          )}"
-          + "${attr "privileges" mc.privileges}${attr "limit_privileges" mc.limitPrivileges}/>\n"
-        );
-        env = optionalString (mc.environment != { }) ''
-          ${indent}  <method_environment>
-          ${
-            concatStrings (
-              mapAttrsToList (n: v: "${indent}    <envvar name='${esc n}' value='${esc v}'/>\n") mc.environment
+  # A list, so that an absent context contributes nothing to its parent.
+  methodContextNodes =
+    mc:
+    optional (hasMethodContext mc) (
+      elem "method_context"
+        {
+          working_directory = mc.workingDirectory;
+          inherit (mc) project;
+          resource_pool = mc.resourcePool;
+        }
+        (
+          optional (mc.user != null) (leaf "method_credential" {
+            inherit (mc) user group;
+            supp_groups =
+              if mc.supplementaryGroups == [ ] then null else concatStringsSep "," mc.supplementaryGroups;
+            inherit (mc) privileges;
+            limit_privileges = mc.limitPrivileges;
+          })
+          ++ optional (mc.environment != { }) (
+            elem "method_environment" { } (
+              mapAttrsToList (n: v: leaf "envvar" {
+                name = n;
+                value = v;
+              }) mc.environment
             )
-          }${indent}  </method_environment>
-        '';
-      in
-      ''
-        ${indent}<method_context${attr "working_directory" mc.workingDirectory}${attr "project" mc.project}${attr "resource_pool" mc.resourcePool}>
-        ${credential}${env}${indent}</method_context>
-      ''
+          )
+        )
     );
 
   # <exec_method> ------------------------------------------------------------
 
-  renderExecMethod =
-    indent: name: m:
-    let
-      open = "${indent}<exec_method type='${m.type}' name='${esc name}' exec='${esc m.exec}' timeout_seconds='${toString m.timeoutSeconds}'";
-      inner = renderMethodContext "${indent}  " m.methodContext;
-    in
-    if inner == "" then "${open}/>\n" else "${open}>\n${inner}${indent}</exec_method>\n";
+  execMethodNode =
+    name: m:
+    elem "exec_method" {
+      inherit (m) type;
+      inherit name;
+      inherit (m) exec;
+      timeout_seconds = m.timeoutSeconds;
+    } (methodContextNodes m.methodContext);
 
   # <template> ---------------------------------------------------------------
 
-  renderTemplate =
-    indent: t:
-    let
-      documentation = optionalString (t.manpages != [ ] || t.docLinks != [ ]) ''
-        ${indent}  <documentation>
-        ${
-          concatMapStrings (
-            m:
-            "${indent}    <manpage title='${esc m.title}' section='${esc m.section}' manpath='${esc m.manpath}'/>\n"
-          ) t.manpages
-        }${
-          concatMapStrings (
-            l: "${indent}    <doc_link name='${esc l.name}' uri='${esc l.uri}'/>\n"
-          ) t.docLinks
-        }${indent}  </documentation>
-      '';
-    in
-    ''
-      ${indent}<template>
-      ${indent}  <common_name>
-      ${indent}    <loctext xml:lang='C'>${esc t.commonName}</loctext>
-      ${indent}  </common_name>
-      ${
-        optionalString (t.description != null) ''
-          ${indent}  <description>
-          ${indent}    <loctext xml:lang='C'>${esc t.description}</loctext>
-          ${indent}  </description>
-        ''
-      }${documentation}${indent}</template>
-    '';
+  loctextNode = s: elem "loctext" { "xml:lang" = "C"; } [ (text s) ];
+
+  templateNode =
+    t:
+    elem "template" { } (
+      [ (elem "common_name" { } [ (loctextNode t.commonName) ]) ]
+      ++ optional (t.description != null) (elem "description" { } [ (loctextNode t.description) ])
+      ++ optional (t.manpages != [ ] || t.docLinks != [ ]) (
+        elem "documentation" { } (
+          map (m: leaf "manpage" { inherit (m) title section manpath; }) t.manpages
+          ++ map (l: leaf "doc_link" { inherit (l) name uri; }) t.docLinks
+        )
+      )
+    );
 
   # <instance> ---------------------------------------------------------------
 
-  renderInstance = indent: name: inst: ''
-    ${indent}<instance name='${esc name}' enabled='${boolToString inst.enabled}'>
-    ${concatStrings (mapAttrsToList (renderDependency "${indent}  ") inst.dependencies)}${concatStrings (mapAttrsToList (renderDependent "${indent}  ") inst.dependents)}${renderMethodContext "${indent}  " inst.methodContext}${concatStrings (mapAttrsToList (renderExecMethod "${indent}  ") inst.execMethods)}${concatStrings (mapAttrsToList (renderPropertyGroup "${indent}  ") inst.propertyGroups)}${indent}</instance>
-  '';
+  # The child order below is not decoration: the DTD's content models are
+  # sequences, not choices, so a manifest whose elements are correct but
+  # misordered is rejected outright.
+  commonChildren = x:
+    concatLists (mapAttrsToList dependencyNodes x.dependencies)
+    ++ mapAttrsToList dependentNode x.dependents
+    ++ methodContextNodes x.methodContext
+    ++ mapAttrsToList execMethodNode x.execMethods
+    ++ mapAttrsToList propertyGroupNode x.propertyGroups;
+
+  instanceNode =
+    name: inst:
+    elem "instance" {
+      inherit name;
+      inherit (inst) enabled;
+    } (commonChildren inst);
 
   # <service> / <service_bundle> ---------------------------------------------
 
-  renderService = svc: ''
-    <?xml version='1.0'?>
-    <!DOCTYPE service_bundle SYSTEM '/usr/share/lib/xml/dtd/service_bundle.dtd.1'>
-    <!-- Generated by nixbsd; do not edit. -->
-    <service_bundle type='manifest' name='${esc svc.bundleName}'>
-      <service name='${esc svc.name}' type='${svc.type}' version='${toString svc.version}'>
-    ${optionalString (svc.defaultInstance.enable) "    <create_default_instance enabled='${boolToString svc.defaultInstance.enabled}'/>\n"}${optionalString svc.singleInstance "    <single_instance/>\n"}${concatStrings (mapAttrsToList (renderDependency "    ") svc.dependencies)}${concatStrings (mapAttrsToList (renderDependent "    ") svc.dependents)}${renderMethodContext "    " svc.methodContext}${concatStrings (mapAttrsToList (renderExecMethod "    ") svc.execMethods)}${concatStrings (mapAttrsToList (renderPropertyGroup "    ") svc.propertyGroups)}${concatStrings (mapAttrsToList (renderInstance "    ") svc.instances)}    <stability value='${svc.stability}'/>
-    ${renderTemplate "    " svc.template}  </service>
-    </service_bundle>
-  '';
+  serviceNode =
+    svc:
+    elem "service_bundle"
+      {
+        type = "manifest";
+        name = svc.bundleName;
+      }
+      [
+        (elem "service"
+          {
+            inherit (svc) name type;
+            version = svc.version;
+          }
+          (
+            optional svc.defaultInstance.enable (leaf "create_default_instance" {
+              inherit (svc.defaultInstance) enabled;
+            })
+            ++ optional svc.singleInstance (leaf "single_instance" { })
+            ++ commonChildren svc
+            ++ mapAttrsToList instanceNode svc.instances
+            ++ [
+              (leaf "stability" { value = svc.stability; })
+              (templateNode svc.template)
+            ]
+          )
+        )
+      ];
+
+  renderService =
+    svc:
+    xml.document {
+      doctype = "<!DOCTYPE service_bundle SYSTEM '/usr/share/lib/xml/dtd/service_bundle.dtd.1'>";
+      comment = "Generated by nixbsd; do not edit.";
+    } (serviceNode svc);
 
   # A file name for a manifest: svc:/site/nginx -> site/nginx.xml
   manifestPath = svc: "${svc.name}.xml";

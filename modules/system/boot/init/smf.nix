@@ -51,12 +51,48 @@ let
 
   # <dependency>/<dependent> -------------------------------------------------
 
-  renderDependency = indent: name: d: ''
-    ${indent}<dependency name='${esc name}' grouping='${d.grouping}' restart_on='${d.restartOn}' type='${esc d.type}'>
-    ${
-      concatMapStrings (f: "${indent}  <service_fmri value='${esc f}'/>\n") d.fmris
-    }${indent}</dependency>
-  '';
+  # A `<dependency>` holding more than one `<service_fmri>` kills svc.configd
+  # during `svccfg import`. The import dies with
+  #
+  #     svccfg: Could not delete svc:/TEMP/<service> (repository connection broken).
+  #
+  # which is ECONNABORTED from the door call -- configd is gone, and gone
+  # silently, without the message its own error paths would have printed. The
+  # repository is left incomplete and svc.startd then puts everything into
+  # maintenance. Bisected by narrowing the one manifest that had two FMRIs in a
+  # single block (sshd) down to one, after which all nine manifests import
+  # cleanly.
+  #
+  # So emit one block per FMRI. For the "all" groupings that is the same thing:
+  # requiring A and B in one block is requiring A in one block and B in another.
+  #
+  # It is *not* the same for `require_any` ("any one of these") or `exclude_all`,
+  # so those are left alone and will still hit the bug -- better than silently
+  # turning "any" into "all". Nothing generates them today.
+  #
+  # TODO drop this once configd is fixed. The real bug is configd's, and any
+  # hand-written illumos manifest hits it too, where multi-FMRI dependencies are
+  # entirely normal.
+  splittableGrouping = g: g == "require_all" || g == "optional_all";
+
+  renderDependency =
+    indent: name: d:
+    let
+      one = suffix: f: ''
+        ${indent}<dependency name='${esc (name + suffix)}' grouping='${d.grouping}' restart_on='${d.restartOn}' type='${esc d.type}'>
+        ${indent}  <service_fmri value='${esc f}'/>
+        ${indent}</dependency>
+      '';
+    in
+    if splittableGrouping d.grouping && length d.fmris > 1 then
+      concatStrings (imap0 (i: f: one "-${toString i}" f) d.fmris)
+    else
+      ''
+        ${indent}<dependency name='${esc name}' grouping='${d.grouping}' restart_on='${d.restartOn}' type='${esc d.type}'>
+        ${
+          concatMapStrings (f: "${indent}  <service_fmri value='${esc f}'/>\n") d.fmris
+        }${indent}</dependency>
+      '';
 
   renderDependent = indent: name: d: ''
     ${indent}<dependent name='${esc name}' grouping='${d.grouping}' restart_on='${d.restartOn}'>

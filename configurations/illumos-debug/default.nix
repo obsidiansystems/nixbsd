@@ -1,8 +1,119 @@
 {
+  config,
   lib,
   pkgs,
   ...
 }:
+let
+  p = n: pkgs.illumos.${n} or null;
+
+  # The boot sequence, as a program: ./bootstrap.c does the remount, the
+  # mkdirs, devfsadm, soconfig and the virtio-fs mount, checking every one, and
+  # then execs the shell.
+  #
+  # It lives here rather than in nixpkgs' illumos set because it is policy, not
+  # mechanism -- see the header comment in ./bootstrap.nix. `callPackage` off
+  # that set so it is built by the same cross compiler, against the same gate
+  # headers, as `mountvfs` and the rest.
+  #
+  # This used to be the /etc/profile below, and moving it out of the shell was
+  # not tidying. It changes two things:
+  #
+  #   * bash and coreutils stop being BOOT dependencies. Nothing on the path
+  #     from the kernel exec'ing init to the store being mounted is a shell
+  #     command any more; the shell is the thing that runs AFTER, and it is
+  #     staged as `bootArchive.debugTools`, which is the option that exists to
+  #     say precisely that. A failed mount still lands on a usable prompt.
+  #
+  #   * failures stop being invisible. A non-interactive profile continues
+  #     past every error without a word -- that is how a missing `mkdir
+  #     -p /mnt/store` presented as a virtio-fs bug -- and `set -e` would only
+  #     have made it stop without a word. Each step now names itself and its
+  #     errno on the console.
+  #
+  # The network bring-up is passed only when the packages that perform it are
+  # actually staged. Under `bootArchive.minimal` they are not (they are meant
+  # to be reached over the very mount this program performs), and a store path
+  # compiled into the binary is a nix *reference*: naming them there would drag
+  # dlmgmtd, ifconfig, setaddr and their libdladm closure into the archive to
+  # do nothing at all.
+  haveNetwork = builtins.all (x: x != null) [
+    (p "dlmgmtd")
+    (p "ifconfig")
+    (p "setaddr")
+  ];
+
+  # Guarded the same way every other illumos reference in this file is: the
+  # configuration must still evaluate against a nixpkgs whose illumos set has
+  # not packaged devfsadm or soconfig yet, and `callPackage` would throw on the
+  # missing argument rather than return null.
+  haveBootstrap = builtins.all (x: x != null) [
+    (p "devfsadm")
+    (p "soconfig")
+    (p "init-shell")
+  ];
+
+  bootstrapPkg =
+    if !haveBootstrap then
+      null
+    else
+      pkgs.illumos.callPackage ./bootstrap.nix {
+      # The shell to hand the console to when the sequence is done. This is
+      # the one and only reason bash appears in this configuration's boot
+      # archive -- and it is a `debugTools` shell, not a mount-critical one.
+      shell = pkgs.bashInteractive;
+
+      network =
+        if config.boot.illumos.bootArchive.minimal || !haveNetwork then
+          null
+        else
+          {
+            inherit (pkgs.illumos) dlmgmtd ifconfig setaddr;
+            # qemu's SLIRP hands out fixed addresses: guest 10.0.2.15, host
+            # 10.0.2.2, /24.
+            interface = "vioif0";
+            address = "10.0.2.15";
+            netmask = "255.255.255.0";
+          };
+      };
+
+  # `init-shell` is an /sbin/init that sets the console up -- session, ldterm,
+  # termios -- and then execs one compiled-in program. Its argument is named
+  # `bashInteractive` because that program used to be bash; here it is
+  # `bootstrap`, which does the boot sequence and *then* execs bash itself. So
+  # the chain is
+  #
+  #     kernel -> init (console) -> bootstrap (the six steps) -> bash
+  #
+  # and nothing before the last arrow is a shell.
+  #
+  # The shim exists because init-shell.nix does not merely take a package, it
+  # bakes in a PATH:
+  #
+  #     -DPROG='"${bashInteractive}/bin/bash"'
+  #
+  # so overriding the argument with `bootstrap` compiles in
+  # <bootstrap>/bin/bash, which does not exist -- and init reports that as the
+  # single unhelpful line "init: exec failed", with the machine then powering
+  # itself off. (Asked, answered, and cost one boot.) Rather than change the
+  # nixpkgs package -- init-shell is general-purpose, and "what to exec" is
+  # this configuration's business -- give it a directory whose `bin/bash` is
+  # the program we actually want.
+  initProg =
+    if bootstrapPkg == null then
+      null
+    else
+      pkgs.runCommandLocal "illumos-init-prog" { } ''
+        mkdir -p $out/bin
+        ln -s ${lib.getExe bootstrapPkg} $out/bin/bash
+      '';
+
+  initShell =
+    if initProg == null then
+      p "init-shell"
+    else
+      (p "init-shell").override { bashInteractive = initProg; };
+in
 {
   imports = [ ../illumos-base ];
 
@@ -28,7 +139,7 @@
   #
   #     { sleep 60; printf 'ls -l /devices/pseudo/\n'; sleep 20; } \
   #       | run-nixbsd-illumos-debug-vm
-  boot.illumos.bootArchive.extraFiles."sbin/init" = lib.mkForce "${pkgs.illumos.init-shell}/sbin/init";
+  boot.illumos.bootArchive.extraFiles."sbin/init" = lib.mkForce "${initShell}/sbin/init";
 
   # The network bring-up sequence, written down because the ordering is not
   # guessable and every step was found the hard way. With everything below
@@ -73,6 +184,13 @@
   #
   # Declaring this at the same priority lets all three lists merge.
   boot.illumos.bootArchive.storePaths = lib.mkDefault (lib.filter (p: p != null) [
+    # The boot sequence itself. It has to be a *root*, not merely referenced:
+    # /sbin/init is staged with `extraFiles`, which copies a file, and a copied
+    # file's references are not followed. Without this the archive holds an
+    # init whose compiled-in program does not exist -- which the kernel reports
+    # as the memorably terse "init: exec failed".
+    initProg
+
     # Populates /dev. Without it there is no /dev/dsk, no /dev/rdsk, and no
     # link for the ramdisk, which is why mount(8) has had nothing to open.
     (pkgs.illumos.devfsadm or null)
@@ -180,6 +298,19 @@
     (pkgs.illumos.dlmgmtd or null)
   ]);
 
+  # And the same root under `bootArchive.minimal`, which replaces `storePaths`
+  # wholesale rather than filtering it (see the archive builder). `mkDefault`
+  # for the same merge reason as above: the module declares this list at that
+  # priority, and a normal-priority definition here would discard it -- leaving
+  # a minimal archive with no libc.
+  #
+  # This is the *only* addition minimal needs. Everything bootstrap execs
+  # (devfsadm, soconfig) is already in that list, and the two mount helpers it
+  # replaces -- mount-ufs and mountvfs -- are still there for use by hand.
+  boot.illumos.bootArchive.minimalStorePaths = lib.mkDefault (
+    lib.filter (x: x != null) [ initProg ]
+  );
+
   # Break the deadlock between devfsadm and the read-only root.
   #
   # devfsadm keeps its state and its lock in /etc/dev, and refuses to run
@@ -221,105 +352,23 @@
     "etc/devlink.tab" = "${pkgs.illumos.devfsadm}/etc/devlink.tab";
   };
 
-  # Bring the network up at boot, so the machine is reachable by ssh without
-  # anyone typing anything.
+  # What is left of /etc/profile: a PATH, and nothing else.
   #
-  # `init-shell` starts bash as a *login* shell, so /etc/profile is the only
-  # hook there is: this configuration has bash as pid 1, so there is no
-  # profile, no service manager and nothing between the kernel exec'ing init
-  # and a prompt. Everything below was determined by hand and the ordering is
-  # not guessable -- see the sequence documented above.
+  # The boot sequence that used to live here is now ./bootstrap.c, exec'd by
+  # init before the shell ever starts -- see the top of this file. This
+  # remains only because bash reads it and a prompt with no PATH is miserable
+  # to type at, and it is deliberately inert: if it never runs, if a package
+  # in it is missing, if the whole file is absent, the machine still boots and
+  # still mounts its store. That was not true a commit ago, when this file WAS
+  # the boot sequence and a "command not found" in it took /mnt/store with it.
   #
-  # This is deliberately *not* how it should end up. The right home for all of
-  # it is illumos-smf.nix as svc:/network/physical and svc:/network/ssh, with
-  # real dependencies instead of `sleep`. It lives here because the SMF path
-  # needs the full configuration, which costs a 1.3GB archive and a long boot
-  # per iteration, and because having it working somewhere is what makes
-  # moving it a refactor rather than a fresh investigation.
-  boot.illumos.bootArchive.files."etc/profile" =
-    let
-      p = n: pkgs.illumos.${n} or null;
-      have = builtins.all (x: x != null) [
-        (p "devfsadm") (p "soconfig") (p "dlmgmtd") (p "ifconfig")
-        (p "setaddr") (p "mount-ufs") (p "mountvfs")
-      ];
-    in
-    lib.mkIf have ''
-      # A PATH, FIRST, because everything below depends on it.
-      #
-      # This script calls `mkdir`, `cp` and `chmod` by bare name. Under the
-      # full closure that happens to work: the system's /bin and /usr/bin are
-      # staged and bash's compiled-in default PATH finds them. Under
-      # `bootArchive.minimal` they are not, so with the PATH set anywhere later
-      # than here EVERY plain command in this file is "command not found" --
-      # silently, because a non-interactive profile keeps going after an error.
-      #
-      # The symptom is remote from the cause and thoroughly misleading: /mnt is
-      # never created, so the virtio-fs mount has no mountpoint, and the
-      # console shows a perfectly healthy system with an empty /etc/mnttab. It
-      # reads as a virtio-fs failure and is not one.
-      #
-      # `pkgs.coreutils`, not `p "coreutils"`: `p` looks in the illumos package
-      # set, which holds only what is built from the gate. Spelling it that way
-      # returns null, and since this whole file is behind `lib.mkIf have`, the
-      # result is not an error -- it is a silently absent /etc/profile.
-      export PATH=${pkgs.coreutils}/bin:${pkgs.bash}/bin:$PATH
-
-      # The root is mounted read-only by ufs_mountroot(); sdev's backing store
-      # is the root filesystem, so until this runs devfsadm cannot create nodes
-      # and /etc cannot be written.
-      ${p "mount-ufs"}/lib/fs/ufs/mount -o remount,rw /devices/ramdisk:a / \
-          >/dev/null 2>&1
-
-      # devfsadm keeps its lock behind the /etc/dev symlink; `mkdir -p
-      # /etc/dev` follows the link and does *not* create the target.
-      mkdir -p /etc/svc/volatile/dev /etc/dladm /var/run /var/empty
-      ${p "devfsadm"}/sbin/devfsadm 2>/dev/null
-
-      # Without the socket-to-transport mappings, socket(AF_INET, ...) fails
-      # outright and nothing about networking is possible.
-      ${p "soconfig"}/bin/soconfig -d ${p "soconfig"}/etc/sock2path.d 2>/dev/null
-
-      # virtio-fs: the host's /nix/store, read-only, over the virtqueue. The
-      # tag `store` matches the one virtiofsd advertises (see the VM runner in
-      # illumos-boot-image.nix).
-      #
-      # BEFORE the network, and that ordering is load-bearing rather than
-      # tidiness. virtio-fs needs no network at all -- it is a PCI device and a
-      # virtqueue -- whereas everything below needs packages that
-      # `bootArchive.minimal` deliberately leaves out of the archive, on the
-      # grounds that they can be reached over this very mount. With the mount
-      # last, a minimal boot died partway down the network bring-up and never
-      # reached it, so /etc/mnttab had no virtiofs entry and the store was
-      # unreachable -- a bootstrap loop, and one that looks like a virtio-fs
-      # failure from the outside.
-      #
-      # Errors are deliberately NOT redirected. Both the vtfs transport driver
-      # and the virtiofs filesystem were written without ever being compiled,
-      # let alone run, so the failure is the interesting output; hiding it is
-      # how a bring-up loses a day.
-      mkdir -p /mnt/store
-      ${p "mountvfs"}/bin/mountvfs virtiofs store /mnt/store -r
-
-      # dlmgmtd needs a writable copy of its database, and refuses to start
-      # unless SMF_FMRI is set -- it derives its cache file name from the FMRI,
-      # and says so only to syslog, which nothing here reads.
-      cp ${p "dlmgmtd"}/share/dlmgmtd/datalink.conf /etc/dladm/datalink.conf
-      chmod 644 /etc/dladm/datalink.conf
-      SMF_FMRI=svc:/network/datalink-management:default \
-          ${p "dlmgmtd"}/bin/dlmgmtd
-
-      # The NIC is already attached and held by net_dacf, so this only has to
-      # plumb it. `setaddr` rather than ifconfig for the address: ifconfig
-      # resolves even a literal dotted quad through the name service switch,
-      # and the hosts backend does not work here.
-      ${p "ifconfig"}/sbin/ifconfig vioif0 plumb 2>/dev/null
-      ${p "setaddr"}/bin/setaddr vioif0 10.0.2.15 255.255.255.0
-
-      # `grep`, `sed` and friends are NOT in coreutils -- they are their own
-      # packages -- so they are absent under `minimal` unless named here. Three
-      # separate probes have already reported "command not found" for `grep`
-      # and read as system failures when they were the probe's own.
-      export PATH=$PATH:${pkgs.gnugrep}/bin:${pkgs.gnused}/bin
-    '';
+  # `grep`, `sed` and friends are NOT in coreutils -- they are their own
+  # packages -- so they need naming. Three separate probes have reported
+  # "command not found" for `grep` and read as system failures when they were
+  # the probe's own. Under `bootArchive.minimal` these are not staged at all
+  # (they are not `debugTools`), so the entries simply do not resolve, which is
+  # the correct cost for a convenience.
+  boot.illumos.bootArchive.files."etc/profile" = ''
+    export PATH=${pkgs.coreutils}/bin:${pkgs.bash}/bin:${pkgs.gnugrep}/bin:${pkgs.gnused}/bin:$PATH
+  '';
 }

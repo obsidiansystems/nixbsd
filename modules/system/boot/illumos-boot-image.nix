@@ -859,6 +859,38 @@ in
             gawk
           ]
           ++ lib.optional (cfg.rootfs == "ufs") pkgs.illumos.mkfs-ufs;
+
+          # `uts-base.buildtree` is the whole patched kernel source tree, a
+          # 320MB output that exists so `kmod.nix` can build one module at a
+          # time out of it (`src = uts-base.buildtree`). Every kernel module
+          # is therefore one careless reference away from putting it in this
+          # archive's closure, where it would outweigh everything else
+          # combined -- in a ramdisk GRUB copies into RAM before `unix` is
+          # entered.
+          #
+          # It is not a requisite today (checked: `nix-store -qR` on the
+          # archive, zero matches), which is exactly why this can be an
+          # assertion rather than a wish. If a kernel module ever starts
+          # retaining its source tree the build stops here, instead of
+          # producing a bootable-but-enormous image that nobody measures for
+          # months. That is how the 25MB of C headers `excludeStorePaths`
+          # now filters got in.
+          #
+          # Narrow on purpose. The obvious generalisation -- disallowing the
+          # header packages too -- cannot work. `uts-headers`, `head` and
+          # `sys-intel` ARE genuine requisites, retained by `ld.so.1`'s
+          # debug/CTF strings, and `disallowedRequisites` looks at references
+          # rather than at what was copied; filtering them out of the staged
+          # tree removes their bytes but not the references, so naming them
+          # here would fail the build with no fix available short of patching
+          # nixpkgs.
+          #
+          # No `__structuredAttrs` is needed to say this: the throw in
+          # `make-derivation.nix` fires on `allowedRequisites` combined with
+          # `separateDebugInfo`, and a `runCommand` sets no such thing.
+          disallowedRequisites = lib.optionals (
+            (pkgs.illumos.uts-base or null) != null && (pkgs.illumos.uts-base.buildtree or null) != null
+          ) [ pkgs.illumos.uts-base.buildtree ];
         }
         ''
           mkdir -p ba/etc

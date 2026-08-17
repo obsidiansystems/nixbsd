@@ -245,6 +245,26 @@
       ];
     in
     lib.mkIf have ''
+      # A PATH, FIRST, because everything below depends on it.
+      #
+      # This script calls `mkdir`, `cp` and `chmod` by bare name. Under the
+      # full closure that happens to work: the system's /bin and /usr/bin are
+      # staged and bash's compiled-in default PATH finds them. Under
+      # `bootArchive.minimal` they are not, so with the PATH set anywhere later
+      # than here EVERY plain command in this file is "command not found" --
+      # silently, because a non-interactive profile keeps going after an error.
+      #
+      # The symptom is remote from the cause and thoroughly misleading: /mnt is
+      # never created, so the virtio-fs mount has no mountpoint, and the
+      # console shows a perfectly healthy system with an empty /etc/mnttab. It
+      # reads as a virtio-fs failure and is not one.
+      #
+      # `pkgs.coreutils`, not `p "coreutils"`: `p` looks in the illumos package
+      # set, which holds only what is built from the gate. Spelling it that way
+      # returns null, and since this whole file is behind `lib.mkIf have`, the
+      # result is not an error -- it is a silently absent /etc/profile.
+      export PATH=${pkgs.coreutils}/bin:${pkgs.bash}/bin:$PATH
+
       # The root is mounted read-only by ufs_mountroot(); sdev's backing store
       # is the root filesystem, so until this runs devfsadm cannot create nodes
       # and /etc cannot be written.
@@ -296,20 +316,10 @@
       ${p "ifconfig"}/sbin/ifconfig vioif0 plumb 2>/dev/null
       ${p "setaddr"}/bin/setaddr vioif0 10.0.2.15 255.255.255.0
 
-      # A PATH, so an interactive shell can run the staged tools by name.
-      #
-      # Not cosmetic under `bootArchive.minimal`: with a bare shell as init
-      # there is no login profile and no PATH at all, so `ls` and `uname` are
-      # "command not found" and every probe written in terms of them reports a
-      # failure that is really the probe's. That mistake has been made twice
-      # here already. Under `minimal` most of this lives on the virtio-fs
-      # mount, which is why the mount happens first.
-      # `pkgs.coreutils`, not `p "coreutils"`: `p` looks in the illumos package
-      # set, which has only the packages built from the gate. coreutils and
-      # bash are ordinary cross-built packages, so `p` returns null for them --
-      # and because the whole profile is behind `lib.mkIf have`, spelling it
-      # the wrong way does not fail loudly, it silently deletes /etc/profile
-      # and with it the entire boot sequence.
-      export PATH=${pkgs.coreutils}/bin:${pkgs.bash}/bin:$PATH
+      # `grep`, `sed` and friends are NOT in coreutils -- they are their own
+      # packages -- so they are absent under `minimal` unless named here. Three
+      # separate probes have already reported "command not found" for `grep`
+      # and read as system failures when they were the probe's own.
+      export PATH=$PATH:${pkgs.gnugrep}/bin:${pkgs.gnused}/bin
     '';
 }

@@ -48,10 +48,11 @@
     pkgs.nix
 
     # Genuinely illumos-native (`sshd` pulls in libsocket/libnsl/libmd) and
-    # started by SMF below. The kernel now has the IP stack and a NIC driver,
-    # and qemu is passed a virtio NIC with a port forward -- what is still
-    # missing is an address on it, since `ifconfig` links libdladm and
-    # libipadm and neither is packaged yet.
+    # started by SMF below. The kernel has the IP stack and a NIC driver, qemu
+    # is passed a virtio NIC with a port forward, and `illumos.ifconfig` is
+    # packaged now (with libdladm and libipadm beneath it). What is not yet
+    # demonstrated is the NIC being enumerated at all -- see the note on
+    # `services.sshd` below.
     pkgs.openssh
 
     # curl now has GSSAPI, which took packaging `libresolv` so that krb5's
@@ -137,13 +138,15 @@
   # could run. They are folded in here instead: the manifests still get
   # rendered, and now there is an SMF to import them into.
   #
-  # What still does not work is reaching them. The kernel has the IP stack and
-  # two NIC drivers, and the VM is given a virtio NIC with host port 2222
-  # forwarded to guest 22 -- but nothing assigns an address, because
-  # `ifconfig` links libdladm and libipadm and neither is packaged yet.
-  # (`e1000g` is also built, but its attach(9E) unwinds silently after a
-  # mac_register() that can be seen to succeed, which is why the VM asks for
-  # virtio instead. See nixpkgs' illumos `unix.nix`.)
+  # What still does not work is reaching them, though the reason has moved.
+  # `illumos.ifconfig` is packaged now, on top of libdladm and libipadm, so
+  # there is finally something that *could* assign an address. The obstacle is
+  # one level lower: in the VM `/devices/pci@0,0/` contains only `isa@1`, so
+  # the virtio NIC is not enumerated and there is no link to plumb. Until that
+  # is understood, ifconfig has nothing to configure. (`e1000g` is also built,
+  # but its attach(9E) unwinds silently after a mac_register() that can be seen
+  # to succeed, which is why the VM asks for virtio instead. See nixpkgs'
+  # illumos `unix.nix`.)
   services.sshd.enable = lib.mkForce true;
 
   # The host keys have to live somewhere writable. The default paths are under

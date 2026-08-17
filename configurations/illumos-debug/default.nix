@@ -95,6 +95,26 @@
     #
     # It needs a *writable* /etc/dladm/datalink.conf, so the probe has to copy
     # the seed out of the package's share/ rather than link it.
+    #
+    # And it will not start from a shell without help. dlmgmt_init() does:
+    #
+    #     if ((fmri = getenv("SMF_FMRI")) == NULL) {
+    #             dlmgmt_log(LOG_ERR, "dlmgmtd is an smf(7) managed service
+    #                 and should not be run from the command line.");
+    #             return (EINVAL);
+    #     }
+    #
+    # -- it derives its cache file name from the FMRI. So invoke it as either
+    #
+    #     SMF_FMRI=svc:/network/datalink-management:default dlmgmtd
+    #     dlmgmtd -d      # skips the check, stays in foreground, .debug.cache
+    #
+    # Getting this wrong is expensive to notice: `dlmgmt_log` goes to syslog
+    # unless `-d` is given, nothing here reads syslog, and the daemon exits 1
+    # with no output at all. It looks exactly like a daemon that started fine,
+    # and every downstream symptom ("Datalink does not exist", "Could not open
+    # DLPI link") is consistent with a *running* dlmgmtd that simply has no
+    # links -- so the failure hides behind plausible errors one layer up.
     (pkgs.illumos.dlmgmtd or null)
   ]);
 

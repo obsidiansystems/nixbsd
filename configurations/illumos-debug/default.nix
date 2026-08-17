@@ -30,6 +30,29 @@
   #       | run-nixbsd-illumos-debug-vm
   boot.illumos.bootArchive.extraFiles."sbin/init" = lib.mkForce "${pkgs.illumos.init-shell}/sbin/init";
 
+  # The network bring-up sequence, written down because the ordering is not
+  # guessable and every step was found the hard way. With everything below
+  # staged, this is what takes a booted machine to a plumbed interface:
+  #
+  #   mount -o remount,rw /devices/ramdisk:a /   # sdev's backing store is the
+  #                                             # root fs; without this
+  #                                             # devfsadm cannot create nodes
+  #                                             # and /etc is unwritable
+  #   mkdir -p /etc/svc/volatile/dev /etc/dladm  # devfsadm's lock lives behind
+  #                                             # the /etc/dev symlink below;
+  #                                             # `mkdir -p /etc/dev` does NOT
+  #                                             # create it, it follows the link
+  #   devfsadm                                  # populates /dev
+  #   soconfig -d <pkg>/etc/sock2path.d         # or socket(AF_INET) = EAFNOSUPPORT
+  #   cp <pkg>/share/dlmgmtd/datalink.conf /etc/dladm/
+  #   SMF_FMRI=svc:/network/datalink-management:default dlmgmtd   # or -d
+  #   ifconfig vioif0 plumb
+  #
+  # The NIC itself needs no coaxing: with the `net_dacf` kernel module built,
+  # it attaches during boot and stays attached, and /dev/net/vioif0 exists
+  # before any of this runs. Without that module every step above still
+  # "succeeds" and the plumb fails with "Could not open DLPI link".
+  #
   # The things under investigation, staged so they can be run by hand from the
   # shell above. `storePaths` rather than `environment.systemPackages` because
   # with a bare shell as init there is no profile and no PATH to speak of;
@@ -86,6 +109,25 @@
     #
     #     soconfig -d <this package>/etc/sock2path.d
     (pkgs.illumos.soconfig or null)
+
+    # The modern IP configuration tool. `ifconfig` is staged too, but it cannot
+    # parse an address here -- it resolves even a literal dotted quad through
+    # the name service switch, and the hosts lookup is broken. ipadm goes
+    # through getaddrinfo(), which parses numerics directly:
+    #
+    #     ipadm create-addr -T static -a 10.0.2.15/24 vioif0/v4
+    (pkgs.illumos.ipadm or null)
+
+    # Last resort for putting an address on the interface: both ifconfig and
+    # ipadm fail before reaching the kernel (name service switch, and address
+    # objects, respectively). This does the three ioctls directly.
+    (pkgs.illumos.setaddr or null)
+
+    # sshd, the actual objective. nixpkgs builds openssh with `withPAM`
+    # defaulting to `isLinux`, so this is a *non*-PAM build: it authenticates
+    # against /etc/shadow through getpwnam/getspnam, which is why nss-files
+    # had to work first.
+    (pkgs.openssh or null)
 
     # The datalink management daemon. libdladm asks it, over a door, for every
     # datalink question; with no daemon there is no door, and ifconfig (via

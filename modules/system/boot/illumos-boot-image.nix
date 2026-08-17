@@ -155,6 +155,10 @@ in
         "etc/svc/volatile"
         "etc/dfs"
         "var/run"
+        # sshd(8)'s privilege-separation chroot. OpenSSH has no
+        # UsePrivilegeSeparation switch any more -- it always separates -- so
+        # this directory and the `sshd` user above are both mandatory.
+        "var/empty"
         "usr"
       ];
       description = ''
@@ -286,7 +290,7 @@ in
       # The `files` name service backend. It is symlinked into /lib/amd64
       # below, but it also has to be in the closure or the store path the
       # symlink points at is not in the image at all.
-      ++ lib.optional (pkgs.illumos.nss_files or null != null) pkgs.illumos.nss_files
+      ++ lib.optional (pkgs.illumos.nss-files or null != null) pkgs.illumos.nss-files
     );
 
     # init-shell's compiled-in environment is PATH=/bin:/usr/bin:/sbin, and
@@ -450,19 +454,42 @@ in
         bin:x:2:2::/usr/bin:
         sys:x:3:3::/:
         nobody:x:60001:60001:NFS Anonymous Access User:/:
+        sshd:x:22:22:sshd privsep:/var/empty:/bin/false
         noaccess:x:60002:60002:No Access User:/:
       '';
 
-      # `*LK*` is illumos' locked-account marker. No hash is invented here:
-      # nothing consumes /etc/shadow yet -- login(1) is not packaged and sshd
-      # is not reachable without a network stack -- and the build host has no
-      # crypt(3) producing illumos' $5$ SHA-256 form, so any hash written now
-      # would be unverifiable.
+      # No hash is invented here: the build host has no crypt(3) producing
+      # illumos' $5$ SHA-256 form, so any hash written now would be
+      # unverifiable. Password login is impossible by construction, which is
+      # the intent -- authentication is by key.
+      #
+      # root gets `NP`, not `*LK*`, and the distinction is load-bearing.
+      # `*LK*` is illumos' *locked account* marker and OpenSSH knows it:
+      # configure sets LOCKED_PASSWD_STRING="*LK*" on this platform, and
+      # allowed_user() (auth.c) refuses any account whose shadow password
+      # equals it -- before ever consulting authorized_keys. A public-key
+      # login then fails as nothing more informative than
+      #
+      #     Permission denied (publickey,password,keyboard-interactive).
+      #
+      # and only under `sshd -ddd`:
+      #
+      #     userauth_pubkey: invalid user root querying public key ...
+      #     userauth_pubkey: disabled because of invalid user
+      #
+      # "invalid user" for a user getpwnam() resolves perfectly well --
+      # `getent passwd root` returns the entry -- because the check is on the
+      # *shadow* entry, not the passwd one.
+      #
+      # `NP` ("no password") is illumos' marker for an account that cannot be
+      # logged into with a password but is not locked. The daemon accounts
+      # below already carry it; it leaves key authentication alone.
       "etc/shadow" = ''
-        root:*LK*:::::::
+        root:NP:::::::
         daemon:NP:::::::
         bin:NP:::::::
         sys:NP:::::::
+        sshd:NP:::::::
         nobody:*LK*:::::::
         noaccess:*LK*:::::::
       '';
@@ -473,6 +500,7 @@ in
         bin::2:root,daemon
         sys::3:root,bin,adm
         adm::4:root,daemon
+        sshd::22:
         nobody::60001:
         noaccess::60002:
       '';
@@ -490,7 +518,7 @@ in
       #
       # This is only half of what that check needs; the other half is a
       # working name service switch, since both the uid-to-name lookup and
-      # this file's parsing go through it. See the `nss_files` package.
+      # this file's parsing go through it. See the `nss-files` package.
       "etc/user_attr" = ''
         root::::type=normal;auths=solaris.*,solaris.grant;profiles=All;lock_after_retries=no
       '';
@@ -641,8 +669,8 @@ in
           # far from here: `ifconfig ... plumb` reports "Insufficient user
           # authorizations" while running as root, because the uid-to-name
           # lookup behind chkauthattr() has no backend to answer it.
-          ${lib.optionalString (pkgs.illumos.nss_files or null != null) ''
-            for f in ${pkgs.illumos.nss_files}/lib/nss_*.so.*; do
+          ${lib.optionalString (pkgs.illumos.nss-files or null != null) ''
+            for f in ${pkgs.illumos.nss-files}/lib/nss_*.so.*; do
               [ -e "$f" ] || continue
               ln -sfn "$f" "ba/lib/amd64/$(basename "$f")"
             done

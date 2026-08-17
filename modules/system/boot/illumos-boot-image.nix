@@ -591,6 +591,19 @@ in
           # has, invisible until the one subsystem that needs it runs.
           cp ${gate}/usr/src/cmd/netfiles/netconfig ba/etc/netconfig
 
+          # /etc/nfssec.conf is the companion table: it names the RPC security
+          # flavours (`sys`, `dh`, `krb5`, ...) and maps them onto their
+          # pseudo-flavour numbers. The NFS mount helper calls
+          # nfs_getseconfig_default() (cmd/fs.d/nfs/lib/nfs_sec.c) before it
+          # can build the mount arguments, even for plain AUTH_SYS, so with the
+          # file absent it stops at
+          #
+          #     nfs mount: error getting default security entry
+          #
+          # having again sent no packet. This is the file /etc/netconfig
+          # uncovered: fixing one revealed the next.
+          cp ${gate}/usr/src/cmd/fs.d/nfs/etc/nfssec.conf ba/etc/nfssec.conf
+
           cp ${pkgs.writeText "driver_aliases" cfg.driverAliases} ba/etc/driver_aliases
           : >ba/etc/system
           : >ba/etc/mnttab

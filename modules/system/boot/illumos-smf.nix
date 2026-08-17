@@ -65,6 +65,12 @@ let
   configd = pkgs.illumos.svc-configd or null;
   svccfg = pkgs.illumos.svccfg or null;
   soconfig = pkgs.illumos.soconfig or null;
+  mountUfs = pkgs.illumos.mount-ufs or null;
+
+  # Whether to try to get a writable root. Only meaningful for a UFS root --
+  # hsfs cannot be written at all -- and only possible once mount(8) for ufs is
+  # packaged, hence the `or null` above.
+  remountRoot = config.boot.illumos.rootfs or "hsfs" == "ufs" && mountUfs != null;
 
   # Spelled `or null` throughout, and gated on all four: this module has to
   # stay evaluable against a nixpkgs that has not packaged them yet. See the
@@ -109,6 +115,75 @@ let
     # utilities' directory rather than trusting a default PATH.
     PATH=${pkgs.coreutils}/bin:${pkgs.bash}/bin
     export PATH
+
+    ${optionalString remountRoot ''
+      # Get a writable root.
+      #
+      # The kernel always mounts the root read-only -- ufs_mountroot() sets
+      # VFS_RDONLY for ROOT_INIT (uts/common/fs/ufs/ufs_vfsops.c) -- and
+      # illumos reaches a writable one through a second, ROOT_REMOUNT pass.
+      # Upstream drives that from svc:/system/filesystem/root, whose method
+      # script wants a good deal more of userland than is packaged here, so do
+      # just the remount and do it before anything wants to write.
+      #
+      # The fstype-specific mount is invoked directly rather than through the
+      # generic /usr/sbin/mount, which is not packaged. That means supplying
+      # both operands: cmd/fs.d/ufs/mount/mount.c:226 insists on exactly two
+      # (`(argc - optind) != 2` is a usage error), because resolving one from
+      # the other is the dispatcher's job, not this program's. Its usage text
+      # saying `{special | mount_point}` describes the dispatcher, not itself.
+      #
+      # The special is read out of /etc/mnttab rather than written down here.
+      # It is /ramdisk:a today, but that is a consequence of the root being a
+      # multiboot module, and it stops being true the moment the root moves to
+      # a real disk. mnttab is the kernel's own answer to the question.
+      #
+      # Pure shell, no awk: this script's PATH is coreutils and bash only.
+      root_special=
+      while read -r special mountp rest; do
+        if [ "$mountp" = "/" ]; then
+          root_special=$special
+          break
+        fi
+      done < /etc/mnttab
+
+      # What mnttab reports is not always a path that can be opened. For a
+      # ramdisk root it is the boot-time name the kernel used:
+      #
+      #     /ramdisk:a      /       ufs     dev=600001      0
+      #
+      # while the block device node actually lives at /devices/ramdisk:a --
+      # note *not* under /devices/pseudo/, which is where the ramdisk@1024
+      # directory sits and where it is natural to go looking. mount(8) needs
+      # the node, and fails with "no such file or directory" given the name.
+      #
+      # A disk root does report an openable path (/dev/dsk/...), so prefer the
+      # name as given and only fall back to prefixing /devices.
+      if [ -n "$root_special" ] && [ ! -e "$root_special" ] \
+         && [ -e "/devices$root_special" ]; then
+        root_special=/devices$root_special
+      fi
+
+      # Best-effort, like everything else in this script: if any of this fails
+      # the boot continues with a read-only root, which is what it did before,
+      # and the `set -x` trace says so.
+      if [ -n "$root_special" ]; then
+        ${mountUfs}/lib/fs/ufs/mount -o remount,rw "$root_special" /
+      else
+        echo "smf-bootstrap: no root entry in /etc/mnttab; not remounting"
+      fi
+
+      # `set -x` shows the command but not whether it achieved anything, and
+      # the distinction matters to everything below: with a read-only root the
+      # /etc/svc/volatile redirections are load-bearing, and without one they
+      # are not.
+      if touch /.rw-probe 2>/dev/null; then
+        rm -f /.rw-probe
+        echo "smf-bootstrap: root is writable"
+      else
+        echo "smf-bootstrap: root is READ-ONLY; the remount above did not take"
+      fi
+    ''}
 
     # The writable tree. /etc/svc/volatile is a kernel-mounted tmpfs; each of
     # these is the target of a symlink baked into the read-only root.

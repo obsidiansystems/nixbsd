@@ -184,6 +184,7 @@ in
         vioif "pci1af4,1041,p"
         vioblk "pci1af4,1001"
         vioblk "pci1af4,1042,p"
+        vtfs "pci1af4,105a"
       '';
       description = ''
         Contents of `/etc/driver_aliases`. add_drv(8) writes this on a live
@@ -854,12 +855,66 @@ in
         fi
         echo "illumos VM: guest ssh port 22 -> localhost:$port" >&2
 
+        # virtio-fs: the host's /nix/store, read-only, as a mountable device.
+        #
+        # This is what replaces materialising the store into a UFS image per
+        # build and copying it into RAM at every boot. NFS cannot do it here:
+        # nfs-ganesha's FSAL_VFS reaches files through open_by_handle_at(2),
+        # which needs CAP_DAC_READ_SEARCH, checked against the *initial* user
+        # namespace -- so a rootless server simply cannot serve, and unshare(1)
+        # does not help.
+        #
+        # virtiofsd meets the same wall and steps around it. Its log says
+        #
+        #     Failed to open file handle for the root node: Operation not permitted
+        #     File handles do not appear safe to use, disabling file handles altogether
+        #
+        # and then serves happily by path. That graceful degradation, not any
+        # difference in privilege, is why this works rootless and NFS does not.
+        #
+        # Read-only twice over, deliberately: --readonly on the daemon, and the
+        # guest cannot write what the daemon will not. The host store must not
+        # be mutable from inside the VM.
+        #
+        # --sandbox none because the namespace sandbox wants privileges we do
+        # not have. It is the right call for a throwaway VM reading a store
+        # that is already world-readable; it would not be for a real service.
+        #
+        # --cache metadata is what allows mmap of shared files, and mmap is not
+        # optional here: executing an ELF binary maps it rather than reading
+        # it, so the store is unusable without it.
+        vfsdir=$(mktemp -d)
+        trap 'rm -rf "$vfsdir"' EXIT
+        ${pkgs.buildPackages.virtiofsd}/bin/virtiofsd \
+          --shared-dir /nix/store \
+          --socket-path "$vfsdir/vfs.sock" \
+          --tag store \
+          --readonly \
+          --sandbox none \
+          --cache metadata \
+          >"$vfsdir/virtiofsd.log" 2>&1 &
+        vfspid=$!
+        trap 'kill $vfspid 2>/dev/null; rm -rf "$vfsdir"' EXIT
+
+        for _ in $(seq 1 50); do
+          [ -S "$vfsdir/vfs.sock" ] && break
+          sleep 0.1
+        done
+        echo "illumos VM: virtiofs tag 'store' -> /nix/store (ro)" >&2
+
+        # vhost-user needs the guest's memory to be shareable with the daemon,
+        # which plain -m does not give: hence memory-backend-memfd,share=on and
+        # a numa node using it. Without this qemu refuses the device outright
+        # ("failed to set up shared memory").
         exec ${pkgs.buildPackages.qemu}/bin/qemu-system-x86_64 \
           -display none -no-reboot \
-          -machine accel=kvm:tcg -cpu max \
+          -machine accel=kvm:tcg,memory-backend=mem0 -cpu max \
           -m ${toString (config.virtualisation.memorySize or 6144)} \
+          -object memory-backend-memfd,id=mem0,size=${toString (config.virtualisation.memorySize or 6144)}M,share=on \
           -smp ${toString (config.virtualisation.cores or 1)} \
           -nic user,model=virtio-net-pci,hostfwd=tcp::"$port"-:22 \
+          -chardev socket,id=vfs0,path="$vfsdir/vfs.sock" \
+          -device vhost-user-fs-pci,chardev=vfs0,tag=store \
           -cdrom ${config.system.build.illumosImage} \
           -serial mon:stdio "$@"
       ''

@@ -175,6 +175,11 @@ in
         kb8042 "pnpPNP,303"
         mouse8042 "pnpPNP,f03"
         pseudo "zconsnex"
+        vioif "pci1af4,1"
+        vioif "pci1af4,1000,p"
+        vioif "pci1af4,1041,p"
+        vioblk "pci1af4,1001"
+        vioblk "pci1af4,1042,p"
       '';
       description = ''
         Contents of `/etc/driver_aliases`. add_drv(8) writes this on a live
@@ -185,6 +190,14 @@ in
         system-kernel-platform.p5m (isa). Without the `pseudo zconsnex` line,
         i_ndi_make_spec_children() complains "init_spec_child: parent=pseudo,
         bad spec (zconsnex)" on every boot.
+
+        The virtio entries come from driver-network-vioif.p5m and
+        driver-storage-vioblk.p5m the same way, and they matter more than they
+        look. A devinfo node whose driver never binds does not appear in devfs
+        at all, so without these `/devices/pci@0,0/` contains only `isa@1` --
+        the virtio NIC and disk are simply invisible, and it reads like the
+        devices are absent rather than merely unbound. That blocks plumbing an
+        address and blocks mounting anything off a virtio disk.
       '';
     };
 

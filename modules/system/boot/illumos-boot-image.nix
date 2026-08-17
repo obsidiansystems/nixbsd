@@ -184,9 +184,7 @@ in
           full closure   582662144 (556MiB)
           minimal        165328896 (158MiB)
 
-        and the boot archive inside it, 569376768 against 152043520. The
-        residue is not slack: at 157MiB the archive is almost entirely the
-        kernel modules, which have to be there by construction.
+        and the boot archive inside it, 569376768 against 152043520.
 
         For scale, the timed phases of a whole `illumos-minimal` boot to a
         shell (KVM, one vCPU) after the boot-device and menu changes below:
@@ -202,11 +200,45 @@ in
                                         ~4.9s   (5-6s under host load; the
                                                  kernel phase is what varies)
 
-        So the next real win here is a smaller archive, not a faster loader:
-        what remains is 126MB of DEBUG kernel modules staged unconditionally.
-        Staging only the ones needed before the virtio-fs mount would be worth
-        seconds, and is not done because a hand-picked module list that is
-        subtly wrong fails a long way from where it was written.
+        So the next real win here is a smaller archive, not a faster loader --
+        but it is not where this comment used to say it was. "126MB of DEBUG
+        kernel modules staged unconditionally" was wrong by an order of
+        magnitude, and it was wrong because 126MB was the size of the whole
+        staged *tree* and the kernel was assumed to be all of it. Measured,
+        `du -sk --apparent-size`, on the 152043520-byte archive above:
+
+          staged store closure   105MB   48 paths
+          kernel modules          22MB   ($out/kernel 18MB, /platform 4MB)
+          everything else         <1MB   (/etc tables, /sbin/init, symlinks)
+
+        The kernel is the *small* half. Trimming the module list -- the thing
+        this comment kept pointing at, and the thing that is dangerous because
+        a hand-picked list that is subtly wrong fails a long way from where it
+        was written -- could at most recover 22MB, and only by taking that
+        risk. The closure is 105MB and is nearly all accident:
+
+          uts-headers    23.0MB  header-only, retained by ld.so.1
+          devfsadm       23.1MB  21 linkmods, 1.1MB each
+          ncurses        12.3MB  <- bash
+          libstdc++       9.5MB  <- coreutils -> gmp-with-cxx
+          bash            6.3MB
+          libcMinimal     5.6MB
+          libiconv        3.4MB  <- coreutils
+          coreutils       3.1MB
+          rtld            2.6MB
+          readline        2.1MB  <- bash
+          gmp-with-cxx    2.0MB  <- coreutils
+          head            1.3MB  header-only, retained by ld.so.1
+          (36 more)       ~10MB
+
+        Three of those are packaging bugs in nixpkgs rather than choices made
+        here: `uts-headers`, `head` and `sys-intel` are header-only
+        derivations with nothing to run, and they are in the closure because
+        ld.so.1 carries their store paths in its debug/CTF strings, so nix's
+        reference scanner keeps them. That is 24.8MB -- more than the entire
+        kernel -- of C headers loaded into a ramdisk at boot. Fixing it is a
+        nixpkgs change (scrub those paths out of the shipped ld.so.1), not
+        one this module can make.
 
         The trade is a bootstrap problem, which is the whole reason this is an
         option rather than the default. Whatever performs the mount cannot
@@ -261,13 +293,56 @@ in
         want to be told apart -- otherwise the debugging tail quietly becomes
         load-bearing and nobody can say which half is which.
 
-        The cost of getting this wrong is asymmetric. Carrying a shell costs a
-        megabyte against an archive measured in hundreds; carrying none means
-        a failed mount leaves nothing to look at, on a machine whose console
+        The cost of getting this wrong is asymmetric. Carrying none means a
+        failed mount leaves nothing to look at, on a machine whose console
         goes silent after consconfig() anyway. So this defaults to non-empty.
 
-        Measured: bash and coreutils together are worth about 2MB of the
-        196MiB minimal ISO. That is the whole argument.
+        It is not, however, cheap, and an earlier version of this text said it
+        was: "bash and coreutils together are worth about 2MB of the 196MiB
+        minimal ISO". Both numbers were wrong. The ISO is 158MiB, and the two
+        defaults are worth ~39MB of the 105MB staged closure once their own
+        closures are counted -- these are *roots*, not files:
+
+          bash        ->  bash-interactive 6.3MB
+                          -> readline 2.1MB -> ncurses 12.3MB
+          coreutils   ->  3.1MB
+                          -> libiconv 3.4MB
+                          -> gmp-with-cxx 2.0MB -> libstdc++ 9.5MB
+
+        which is more than the kernel modules cost (22MB). Anything added here
+        should be sized with `nix path-info -Sh`, not by looking at the binary.
+      '';
+    };
+
+    bootArchive.excludeStorePaths = mkOption {
+      type = types.str;
+      default = "-(uts-headers|head|sys-intel)$";
+      description = ''
+        An extended regular expression. Store paths in the staged closure
+        whose name matches it are NOT copied into the archive.
+
+        This is an escape hatch for one specific failure: a path that is a
+        genuine *reference* of something the archive needs, but that nothing
+        in the guest will ever open. The closure is transitive and the
+        reference scanner cannot tell a store path in a debug section from one
+        in a runpath, so such a path cannot be dropped by choosing a smaller
+        root set -- only by filtering the result.
+
+        The default names the three header-only derivations that `rtld` drags
+        in, 24.8MB of C headers that would otherwise be loaded into RAM at
+        every boot. See the note at the staging loop in the archive builder
+        for why they are there and where the real fix lives.
+
+        Adding to this is a decision, not a tidy-up. The archive builder fails
+        the build on any staged path whose name ends in `-headers`, `-dev`,
+        `-src`, `-source`, `-buildtree` or `-debug`, so the way to make such a
+        path acceptable is to name it here -- deliberately, with a comment --
+        rather than to discover it months later by measuring an ISO. It cost
+        exactly that once already.
+
+        The excluded paths are still *referenced* from the archive; the
+        references simply dangle. That is safe only because nothing reads
+        them, which is the whole criterion for putting something here.
       '';
     };
 
@@ -498,9 +573,48 @@ in
     # "Break everything, but quickly" is the accepted trade -- but not so
     # quickly that a failed mount leaves nothing to type into. bash is the
     # shell `init-shell` execs and root's shell in /etc/passwd; coreutils is
-    # 1.3MB and is the difference between having ls/cat/mount output to read
-    # and having only bash builtins. Both together are under 2MB against a
-    # minimal archive of 196MiB, so this is chosen rather than tolerated.
+    # the difference between having ls/cat/mount output to read and having
+    # only bash builtins.
+    #
+    # These are not as cheap as an earlier version of this comment claimed
+    # ("both together are under 2MB"). They are *roots*, and what costs is
+    # the closure under them, measured on `illumos-debug-virtiofs`:
+    #
+    #   bash -> bash-interactive 6.3MB -> readline 2.1MB -> ncurses 12.3MB
+    #   coreutils 3.1MB -> libiconv 3.4MB
+    #                   -> gmp-with-cxx 2.0MB -> libstdc++ 9.5MB
+    #
+    # ~39MB of a 105MB staged closure, for two packages nothing debugs
+    # without. The libstdc++ tail is the one that is simply a mistake --
+    # coreutils links gmp only for `expr`/`factor` bignums, nixpkgs builds gmp
+    # with its C++ bindings, and so a debug shell drags in a C++ runtime it
+    # never loads -- and it is NOT cut here, having been tried twice:
+    #
+    #   * `pkgs.coreutils.override { gmpSupport = false; }` in this list
+    #     alone is wrong, and silently. `illumos-debug`'s /etc/profile writes
+    #     `${pkgs.coreutils}/bin` into PATH as an absolute store path, so the
+    #     archive would hold one coreutils and PATH would name another; every
+    #     plain command in that profile becomes "command not found", /mnt is
+    #     never created, and the virtio-fs mount fails looking like a
+    #     virtio-fs bug. Whatever cuts this has to move both at once.
+    #
+    #   * an overlay in `illumos-base` moves both at once and is worse. An
+    #     overlay applies to every package set, `buildPackages` included, so
+    #     replacing `coreutils` replaces the one stdenv's setup hooks run
+    #     with. The result is a full bootstrap rebuild -- measured: grub,
+    #     imagemagick, perl-GD and libcMinimal all rebuilt, and the build
+    #     failed in packages unrelated to anything here.
+    #
+    # What would work is threading one derivation through both use sites (a
+    # `boot.illumos.debugCoreutils`-style option that /etc/profile also
+    # reads). 11.5MB, and worth doing; it is left undone rather than done
+    # wrong, because both wrong versions look fine until boot.
+    #
+    # readline/ncurses (14.4MB) is deliberately NOT cut. `interactive =
+    # false` would drop it, and it would also drop line editing on the
+    # console -- which is the one thing this list exists to provide on a
+    # machine whose store never arrived. Paying 14MB to be able to type is
+    # the trade this option is for.
     boot.illumos.bootArchive.debugTools = lib.mkDefault [
       pkgs.bash
       pkgs.coreutils
@@ -927,11 +1041,102 @@ in
           # target. That distinction is the whole reason this is affordable at
           # all. `cp -a` also keeps hard links within a store path, which both
           # image formats preserve.
+          # ...minus the build-time-only paths, which is a filter and not a
+          # smaller root set because it cannot be a smaller root set.
+          #
+          # `closureInfo` stages the closure, and a closure is transitive: it
+          # holds everything the reference scanner found, whether or not the
+          # guest will ever open it. On this configuration that is 24.8MB of C
+          # *headers* -- `uts-headers` 23.0MB, `head` 1.3MB, `sys-intel`
+          # 491KB -- more than the entire kernel, loaded into a ramdisk at
+          # boot, for files nothing at runtime reads.
+          #
+          # They arrive through `libc`, which has to be staged (ld.so.1 and
+          # libc.so.1 resolve at their real store paths; PT_INTERP and
+          # DT_RUNPATH are absolute). `libc` is a symlinkJoin, 4KB, over
+          # `libcMinimal` and `rtld`; `rtld`'s own references are exactly
+          # these three header packages, because the store paths survive in
+          # ld.so.1's debug/CTF strings and nix's scanner cannot tell a string
+          # in a debug section from a load-bearing one:
+          #
+          #     $ grep -laF 5mz9gx7...-uts-headers rtld/lib/amd64/*
+          #     rtld/lib/amd64/ld.so.1
+          #
+          # So there is no root set that excludes them while keeping ld.so.1,
+          # and the honest fix is in nixpkgs (scrub those paths out of the
+          # shipped ld.so.1). Until then: stage the closure minus these, and
+          # accept that the archive holds a few dangling references. They are
+          # dangling in the only sense that matters here -- no program opens
+          # them -- and the alternative is paying a kernel's worth of RAM at
+          # every boot for header files.
+          # `-e`, and it is not optional. The default pattern begins with `-`,
+          # so without it grep reads the pattern as a bundle of options,
+          # fails, and -- because this is a pipeline into a file -- leaves
+          # `staged-paths` EMPTY. That produced a 30MB archive with no
+          # userland in it at all, and the build succeeded. Hence the
+          # emptiness check below: a filter that removes everything looks
+          # exactly like a filter that works, right up until the guest has no
+          # libc.
+          grep -v -E -e ${lib.escapeShellArg cfg.bootArchive.excludeStorePaths} \
+            <${closure}/store-paths >staged-paths || true
+
+          excluded=$(( $(wc -l <${closure}/store-paths) - $(wc -l <staged-paths) ))
+          if [ ! -s staged-paths ]; then
+            echo "boot archive: excludeStorePaths matched every path in the" >&2
+            echo "closure. That is never what was meant -- check the pattern:" >&2
+            echo "  ${cfg.bootArchive.excludeStorePaths}" >&2
+            exit 1
+          fi
+          if [ "$excluded" -gt 8 ]; then
+            echo "boot archive: excludeStorePaths dropped $excluded paths." >&2
+            echo "This option is for a handful of known build-time artifacts;" >&2
+            echo "dropping that many means the pattern is too broad, and the" >&2
+            echo "failure would land at boot rather than here." >&2
+            exit 1
+          fi
+
+          # And a build-time guard, because this bloat came back once already
+          # and was found by measuring an ISO months later.
+          #
+          # `disallowedRequisites` is the usual tool and is the wrong one
+          # here: these paths ARE legitimate requisites of `rtld`, so it would
+          # fail the build with no fix available short of patching nixpkgs.
+          # What can be checked is what is actually *staged*, which is this
+          # list, so check that instead: anything whose name says it is a
+          # build-time artifact and that was not explicitly excluded above
+          # fails the build here, at the line that would have copied it.
+          if bad=$(grep -nE '\-(headers|buildtree|dev|src|source|debug)$' staged-paths); then
+            echo "boot archive: build-time-only paths staged:" >&2
+            echo "$bad" >&2
+            echo "" >&2
+            echo "These are build artifacts and must not be in a ramdisk." >&2
+            echo "Either fix the package's runtime references, or -- if it is" >&2
+            echo "genuinely unavoidable, as the header packages below are --" >&2
+            echo "add it to boot.illumos.bootArchive.excludeStorePaths with a" >&2
+            echo "comment saying why." >&2
+            exit 1
+          fi
+
+          echo "boot archive: staging $(wc -l <staged-paths) store paths"
+          echo "boot archive: skipped $excluded by excludeStorePaths:"
+          grep -E -e ${lib.escapeShellArg cfg.bootArchive.excludeStorePaths} \
+            <${closure}/store-paths | sed 's/^/  /' || true
+
           while read -r p; do
             mkdir -p "ba$(dirname "$p")"
             cp -a "$p" "ba$p"
-          done <${closure}/store-paths
+          done <staged-paths
           if [ -d ba/nix ]; then chmod -R u+w ba/nix; fi
+
+          # A ranked inventory in the build log, so the next person to ask
+          # "why is this archive so big" can read the answer instead of
+          # rediscovering it. `--apparent-size` throughout: the image itself
+          # is created with truncate(1) and is sparse, and plain `du` on it
+          # reports allocated blocks and understates it by a wide margin.
+          echo "boot archive: what is in it, biggest first"
+          du -sk --apparent-size ba/kernel ba/platform ba/usr 2>/dev/null | sort -rn
+          du -sk --apparent-size $(cat staged-paths | sed 's,^,ba,') 2>/dev/null \
+            | sort -rn | head -20
 
           # A real illumos root keeps its 64-bit libraries in /lib/amd64, with
           # /lib/64 as the alias. Two things need this and neither goes through

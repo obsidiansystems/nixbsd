@@ -125,7 +125,23 @@
 
     # mount -F nfs, for serving /nix/store from the host read-only instead of
     # baking a UFS image per build and copying it into RAM per boot.
+    #
+    # Kept, though virtio-fs has taken over that job: the NFS client works and
+    # will mount from any *privileged* server. What it cannot do is our case --
+    # nfs-ganesha rootless -- because FSAL_VFS needs CAP_DAC_READ_SEARCH for
+    # open_by_handle_at(2) and treats losing it as fatal.
     (pkgs.illumos.mount-nfs or null)
+
+    # mount(2) with an explicit fstype. Needed because illumos' mount(8) is a
+    # dispatcher that execs /usr/lib/fs/<fstype>/mount, we do not package the
+    # dispatcher, and virtio-fs has no helper at all -- so without this there
+    # is no way to issue the mount, however well the kernel side works. The
+    # first virtio-fs boot proved the point by failing at
+    #
+    #     bash: mount: command not found
+    #
+    # with the modules loaded and the device attached.
+    (pkgs.illumos.mountvfs or null)
 
     # sshd, the actual objective. nixpkgs builds openssh with `withPAM`
     # defaulting to `isLinux`, so this is a *non*-PAM build: it authenticates
@@ -225,7 +241,7 @@
       p = n: pkgs.illumos.${n} or null;
       have = builtins.all (x: x != null) [
         (p "devfsadm") (p "soconfig") (p "dlmgmtd") (p "ifconfig")
-        (p "setaddr") (p "mount-ufs")
+        (p "setaddr") (p "mount-ufs") (p "mountvfs")
       ];
     in
     lib.mkIf have ''
@@ -258,5 +274,20 @@
       # and the hosts backend does not work here.
       ${p "ifconfig"}/sbin/ifconfig vioif0 plumb 2>/dev/null
       ${p "setaddr"}/bin/setaddr vioif0 10.0.2.15 255.255.255.0
+
+      # virtio-fs: the host's /nix/store, read-only, over the virtqueue. The
+      # tag `store` matches the one virtiofsd advertises (see the VM runner in
+      # illumos-boot-image.nix).
+      #
+      # Errors are deliberately NOT redirected. This is brand-new code -- both
+      # the vtfs transport driver and the virtiofs filesystem were written
+      # without ever being compiled, let alone run -- so the failure is the
+      # interesting output, and hiding it is how a bring-up loses a day.
+      #
+      # Not fatal if it fails: everything above has already run, so a failed
+      # mount still leaves a usable shell to investigate from. That stops being
+      # true once the boot archive is trimmed to the mount-critical closure.
+      mkdir -p /mnt/store
+      ${p "mountvfs"}/bin/mountvfs virtiofs store /mnt/store -r
     '';
 }

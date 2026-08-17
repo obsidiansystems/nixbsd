@@ -260,6 +260,27 @@
       # outright and nothing about networking is possible.
       ${p "soconfig"}/bin/soconfig -d ${p "soconfig"}/etc/sock2path.d 2>/dev/null
 
+      # virtio-fs: the host's /nix/store, read-only, over the virtqueue. The
+      # tag `store` matches the one virtiofsd advertises (see the VM runner in
+      # illumos-boot-image.nix).
+      #
+      # BEFORE the network, and that ordering is load-bearing rather than
+      # tidiness. virtio-fs needs no network at all -- it is a PCI device and a
+      # virtqueue -- whereas everything below needs packages that
+      # `bootArchive.minimal` deliberately leaves out of the archive, on the
+      # grounds that they can be reached over this very mount. With the mount
+      # last, a minimal boot died partway down the network bring-up and never
+      # reached it, so /etc/mnttab had no virtiofs entry and the store was
+      # unreachable -- a bootstrap loop, and one that looks like a virtio-fs
+      # failure from the outside.
+      #
+      # Errors are deliberately NOT redirected. Both the vtfs transport driver
+      # and the virtiofs filesystem were written without ever being compiled,
+      # let alone run, so the failure is the interesting output; hiding it is
+      # how a bring-up loses a day.
+      mkdir -p /mnt/store
+      ${p "mountvfs"}/bin/mountvfs virtiofs store /mnt/store -r
+
       # dlmgmtd needs a writable copy of its database, and refuses to start
       # unless SMF_FMRI is set -- it derives its cache file name from the FMRI,
       # and says so only to syslog, which nothing here reads.
@@ -275,19 +296,20 @@
       ${p "ifconfig"}/sbin/ifconfig vioif0 plumb 2>/dev/null
       ${p "setaddr"}/bin/setaddr vioif0 10.0.2.15 255.255.255.0
 
-      # virtio-fs: the host's /nix/store, read-only, over the virtqueue. The
-      # tag `store` matches the one virtiofsd advertises (see the VM runner in
-      # illumos-boot-image.nix).
+      # A PATH, so an interactive shell can run the staged tools by name.
       #
-      # Errors are deliberately NOT redirected. This is brand-new code -- both
-      # the vtfs transport driver and the virtiofs filesystem were written
-      # without ever being compiled, let alone run -- so the failure is the
-      # interesting output, and hiding it is how a bring-up loses a day.
-      #
-      # Not fatal if it fails: everything above has already run, so a failed
-      # mount still leaves a usable shell to investigate from. That stops being
-      # true once the boot archive is trimmed to the mount-critical closure.
-      mkdir -p /mnt/store
-      ${p "mountvfs"}/bin/mountvfs virtiofs store /mnt/store -r
+      # Not cosmetic under `bootArchive.minimal`: with a bare shell as init
+      # there is no login profile and no PATH at all, so `ls` and `uname` are
+      # "command not found" and every probe written in terms of them reports a
+      # failure that is really the probe's. That mistake has been made twice
+      # here already. Under `minimal` most of this lives on the virtio-fs
+      # mount, which is why the mount happens first.
+      # `pkgs.coreutils`, not `p "coreutils"`: `p` looks in the illumos package
+      # set, which has only the packages built from the gate. coreutils and
+      # bash are ordinary cross-built packages, so `p` returns null for them --
+      # and because the whole profile is behind `lib.mkIf have`, spelling it
+      # the wrong way does not fail loudly, it silently deletes /etc/profile
+      # and with it the entire boot sequence.
+      export PATH=${pkgs.coreutils}/bin:${pkgs.bash}/bin:$PATH
     '';
 }

@@ -65,6 +65,18 @@
     # state. devfs hides unattached nodes, so this is the only way from
     # userland to tell "device absent" from "driver bound, attach failed".
     (pkgs.illumos.ditree or null)
+
+    # Prints the kernel messages. illumos has no dmesg(1) that works without
+    # syslogd: cmn_err(9F) output goes to the console driver and to log(4D),
+    # and log(4D) holds everything printed before a console logger registers.
+    # Nothing here registers, so the early boot messages -- including whatever
+    # a failing attach(9E) printed -- exist but are unread. Pair it with
+    # `ditree`, which forces an attach, to catch the failure as it happens:
+    #
+    #     klog -t 5 > /tmp/k.out &
+    #     ditree
+    #     wait; cat /tmp/k.out
+    (pkgs.illumos.klog or null)
   ]);
 
   # Break the deadlock between devfsadm and the read-only root.

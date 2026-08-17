@@ -86,6 +86,16 @@
     #
     #     soconfig -d <this package>/etc/sock2path.d
     (pkgs.illumos.soconfig or null)
+
+    # The datalink management daemon. libdladm asks it, over a door, for every
+    # datalink question; with no daemon there is no door, and ifconfig (via
+    # libipadm) fails before doing anything:
+    #
+    #     ifconfig: unable to open handle to libipadm: Datalink does not exist
+    #
+    # It needs a *writable* /etc/dladm/datalink.conf, so the probe has to copy
+    # the seed out of the package's share/ rather than link it.
+    (pkgs.illumos.dlmgmtd or null)
   ]);
 
   # Break the deadlock between devfsadm and the read-only root.

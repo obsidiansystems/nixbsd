@@ -278,10 +278,16 @@ in
     # dynamically linked illumos program -- can actually run, along with
     # everything on its `PATH`. `system.init` is listed separately because it
     # is freestanding and so is not reachable from `toplevel`'s references.
-    boot.illumos.bootArchive.storePaths = lib.mkDefault [
-      config.system.build.toplevel
-      config.system.init
-    ];
+    boot.illumos.bootArchive.storePaths = lib.mkDefault (
+      [
+        config.system.build.toplevel
+        config.system.init
+      ]
+      # The `files` name service backend. It is symlinked into /lib/amd64
+      # below, but it also has to be in the closure or the store path the
+      # symlink points at is not in the image at all.
+      ++ lib.optional (pkgs.illumos.nss_files or null != null) pkgs.illumos.nss_files
+    );
 
     # init-shell's compiled-in environment is PATH=/bin:/usr/bin:/sbin, and
     # nothing here runs an activation script to populate /run, so give the
@@ -386,6 +392,24 @@ in
         adm::4:root,daemon
         nobody::60001:
         noaccess::60002:
+      '';
+
+      # RBAC authorisations. Being uid 0 is *not* sufficient on illumos: a
+      # privileged operation asks `chkauthattr()`, which looks the caller up by
+      # name and reads that name's authorisations out of this file. With no
+      # entry, root has no authorisations and the operation is refused --
+      #
+      #     ifconfig: cannot plumb vioif0: Insufficient user authorizations
+      #
+      # -- which reads like a permissions bug in the caller and is really a
+      # missing database. `solaris.*` plus `solaris.grant` is what a stock
+      # illumos install gives root.
+      #
+      # This is only half of what that check needs; the other half is a
+      # working name service switch, since both the uid-to-name lookup and
+      # this file's parsing go through it. See the `nss_files` package.
+      "etc/user_attr" = ''
+        root::::type=normal;auths=solaris.*,solaris.grant;profiles=All;lock_after_retries=no
       '';
     };
 
@@ -522,6 +546,24 @@ in
             ln -sfn "$f" "ba/lib/amd64/$(basename "$f")"
           done
           ln -sfn ${pkgs.illumos.libc}/lib/amd64/ld.so.1 ba/lib/amd64/ld.so.1
+
+          # The name service switch backends, for the same reason and by the
+          # same mechanism: libc does not link against them, it `dlopen()`s
+          # "nss_<source>.so.1" by bare name once it has read
+          # /etc/nsswitch.conf. A bare name means the default search path, so a
+          # store path is invisible no matter what is in the closure -- the
+          # library has to appear in /lib/amd64 under exactly that name.
+          #
+          # Without it every `files` lookup fails, and the failures surface
+          # far from here: `ifconfig ... plumb` reports "Insufficient user
+          # authorizations" while running as root, because the uid-to-name
+          # lookup behind chkauthattr() has no backend to answer it.
+          ${lib.optionalString (pkgs.illumos.nss_files or null != null) ''
+            for f in ${pkgs.illumos.nss_files}/lib/nss_*.so.*; do
+              [ -e "$f" ] || continue
+              ln -sfn "$f" "ba/lib/amd64/$(basename "$f")"
+            done
+          ''}
 
           ${lib.concatStringsSep "\n" (
             lib.mapAttrsToList (name: target: ''

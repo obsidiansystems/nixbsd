@@ -85,7 +85,18 @@ let
   gate = pkgs.illumos.source;
 
   # The store paths staged into the archive, resolved on the build machine.
-  closure = pkgs.buildPackages.closureInfo { rootPaths = cfg.bootArchive.storePaths; };
+  #
+  # `minimal` switches the *root set*; it does not filter the result. A closure
+  # is only ever as small as its roots, and `storePaths` is merged from four
+  # places (this module, illumos-init, illumos-smf and the configuration), all
+  # at `mkDefault` so that they add rather than replace -- which also means
+  # nothing can subtract from it. Hence a second, separate list.
+  rootPaths =
+    if cfg.bootArchive.minimal then
+      cfg.bootArchive.minimalStorePaths ++ cfg.bootArchive.debugTools
+    else
+      cfg.bootArchive.storePaths;
+  closure = pkgs.buildPackages.closureInfo { inherit rootPaths; };
 in
 {
   options.boot.illumos = {
@@ -113,6 +124,94 @@ in
         Ridge, so the image carries symlinks and modes: a nix profile stages as
         a symlink farm rather than materialising every link as a copy of its
         target.
+      '';
+    };
+
+    bootArchive.minimal = mkOption {
+      type = types.bool;
+      default = false;
+      description = ''
+        Stage only the mount-critical closure into the archive, and leave
+        everything else to be reached over virtio-fs once the guest has
+        mounted the host's `/nix/store`.
+
+        Archive size is very nearly the whole of boot time, and not by a
+        little. The archive is a multiboot module, so GRUB copies every byte
+        of it into RAM before unix is entered, and the kernel's ramdisk *is*
+        that memory -- there is no demand paging and no second chance. That
+        one copy is ~26s with KVM and ~71s under TCG, and it is also what
+        forces `virtualisation.memorySize = 6144`: the image has to fit in RAM
+        alongside everything else.
+
+        Measured on `illumos-debug`, ISO size, which is what GRUB reads from:
+
+          full closure   582662144 (556MiB)
+          minimal        205174784 (196MiB)   -- 65% smaller
+
+        and the boot archive inside it, 569376768 against 191889408. The
+        residue is not slack: at 196MiB the archive is almost entirely the
+        kernel modules, which have to be there by construction.
+
+        The trade is a bootstrap problem, which is the whole reason this is an
+        option rather than the default. Whatever performs the mount cannot
+        itself come from the mount, so `minimalStorePaths` below has to be a
+        closed set: the kernel and its modules, ld.so.1 and libc, the mount
+        helper, and the /etc data files those read. Anything missed is not a
+        missing-file error at a convenient moment -- it is a machine with no
+        store and no way to get one.
+
+        Not the default, and deliberately so: as of writing the guest-side
+        virtio-fs mount has never succeeded. The `vtfs` transport driver and
+        the `virtiofs` filesystem compile and the qemu device is wired up (see
+        `system.build.vm` below), but nothing has yet been read through it. So
+        the full-closure path remains what boots.
+
+        Note also that this only pays off once the store is mounted *at
+        /nix/store*: everything staged here lives at its real store path
+        because `PT_INTERP` and `DT_RUNPATH` are absolute, and a store mounted
+        anywhere else resolves none of them. The debug configuration currently
+        mounts it at /mnt/store, which is enough to prove the transport works
+        and not enough to run anything out of.
+      '';
+    };
+
+    bootArchive.minimalStorePaths = mkOption {
+      type = types.listOf types.package;
+      default = [ ];
+      description = ''
+        The root set staged into the archive when `minimal` is true, replacing
+        `storePaths` entirely.
+
+        This is the closure that has to exist before the store does, so the
+        test for membership is not "is it useful" but "is it on the path
+        between the kernel entering init and the virtio-fs mount returning".
+        The kernel modules are not in here because they are not store paths --
+        they are copied out of the `unix` derivation into /kernel and
+        /platform by the archive builder, and stay there in either mode.
+      '';
+    };
+
+    bootArchive.debugTools = mkOption {
+      type = types.listOf types.package;
+      default = [ ];
+      example = lib.literalExpression "[ pkgs.bash pkgs.coreutils ]";
+      description = ''
+        Extra packages staged alongside `minimalStorePaths` when `minimal` is
+        true, for looking at a machine whose store never arrived.
+
+        Separate from `minimalStorePaths` on purpose. Everything in that list
+        is there because boot does not work without it; everything in this one
+        is there because *debugging* does not work without it, and the two
+        want to be told apart -- otherwise the debugging tail quietly becomes
+        load-bearing and nobody can say which half is which.
+
+        The cost of getting this wrong is asymmetric. Carrying a shell costs a
+        megabyte against an archive measured in hundreds; carrying none means
+        a failed mount leaves nothing to look at, on a machine whose console
+        goes silent after consconfig() anyway. So this defaults to non-empty.
+
+        Measured: bash and coreutils together are worth about 2MB of the
+        196MiB minimal ISO. That is the whole argument.
       '';
     };
 
@@ -293,6 +392,63 @@ in
       # symlink points at is not in the image at all.
       ++ lib.optional (pkgs.illumos.nss-files or null != null) pkgs.illumos.nss-files
     );
+
+    # The `minimal` root set: what has to be in the archive because it is what
+    # mounts the store.
+    #
+    # Written `or null` and filtered, the same convention the init and SMF
+    # modules use, so this still evaluates against a nixpkgs that has not
+    # packaged one of these yet -- a missing attribute here would be an
+    # evaluation error for every illumos configuration, `minimal` or not.
+    boot.illumos.bootArchive.minimalStorePaths = lib.mkDefault (
+      lib.filter (p: p != null) [
+        # init itself. Freestanding, so it is not reachable from anything
+        # else's references -- exactly as in `storePaths` above.
+        config.system.init
+
+        # ld.so.1 and libc.so.1. /lib/amd64 is a farm of symlinks *into* the
+        # store (see the archive builder), so the store path has to be here or
+        # every one of those links dangles and nothing dynamically linked runs
+        # at all -- which is everything, including the mount helper.
+        pkgs.illumos.libc
+
+        # The name service switch backends, dlopen()'d by bare name. Same
+        # argument: /lib/amd64/nss_files.so.1 is a symlink into the store.
+        (pkgs.illumos.nss-files or null)
+
+        # mount(2) with an explicit fstype: the virtio-fs mount helper. There
+        # is no /usr/lib/fs/virtiofs/mount to dispatch to -- virtio-fs has no
+        # helper at all -- so this *is* the mount, and without it the archive
+        # is minimal for nothing.
+        (pkgs.illumos.mountvfs or null)
+
+        # The three that have to run before the mount can be attempted, in
+        # order. See the sequence in the debug configuration's /etc/profile:
+        # the root is mounted read-only by ufs_mountroot(), sdev's backing
+        # store is the root filesystem, so until mount-ufs has remounted it
+        # read-write devfsadm cannot create a single node -- and with no nodes
+        # there is no device to mount from.
+        (pkgs.illumos.mount-ufs or null)
+        (pkgs.illumos.devfsadm or null)
+
+        # Socket-to-transport mappings. Not needed by virtio-fs itself, but
+        # without them socket(AF_INET, ...) fails at creation, which takes the
+        # network with it -- and the network is the only way to get at a
+        # machine whose console has gone quiet after consconfig().
+        (pkgs.illumos.soconfig or null)
+      ]
+    );
+
+    # "Break everything, but quickly" is the accepted trade -- but not so
+    # quickly that a failed mount leaves nothing to type into. bash is the
+    # shell `init-shell` execs and root's shell in /etc/passwd; coreutils is
+    # 1.3MB and is the difference between having ls/cat/mount output to read
+    # and having only bash builtins. Both together are under 2MB against a
+    # minimal archive of 196MiB, so this is chosen rather than tolerated.
+    boot.illumos.bootArchive.debugTools = lib.mkDefault [
+      pkgs.bash
+      pkgs.coreutils
+    ];
 
     # init-shell's compiled-in environment is PATH=/bin:/usr/bin:/sbin, and
     # nothing here runs an activation script to populate /run, so give the
@@ -545,8 +701,52 @@ in
           # the trees across whole. `usr` matters because a couple of modules
           # install under $(USR_EXEC_DIR) rather than the root one (shbinexec).
           # ($out/lib/libgenunix.so is deliberately left out: it is a link-time
-          # stub, not a loadable module.)
+          # stub, not a loadable module. Naming the three trees rather than
+          # copying $out whole is the entire mechanism -- there is no explicit
+          # exclusion anywhere, so `lib` stays out only for as long as this
+          # list does not grow a fourth entry. It is 19MB, measured, which at
+          # ramdisk prices is worth a sentence.)
           cp -RL --no-preserve=mode ${kernel}/kernel ${kernel}/platform ${kernel}/usr ba/
+
+          # Fold byte-identical modules together.
+          #
+          # A handful of modules are installed under more than one name
+          # because they are more than one kind of thing: `ip` is both a
+          # driver and a STREAMS module, so the gate's Makefiles install the
+          # same object at kernel/drv/amd64/ip *and* kernel/strmod/amd64/ip,
+          # and icmp/udp/tcp go to three places each (drv, strmod, socketmod).
+          #
+          # The `unix` derivation already hard-links these to each other, so
+          # this is not fixing its packaging -- it is undoing what `cp -RL`
+          # does to it. `-L` dereferences, and dereferencing a hard link means
+          # writing the bytes again, so a tree that was compact in the store
+          # arrives here with every alias materialised. Dropping `-L` is not
+          # the fix: it is there so that a symlink in the kernel tree becomes
+          # a real file rather than a link into /nix/store, which the archive
+          # is not allowed to depend on.
+          #
+          # Hard links, not symlinks: kobj resolves modules by walking its
+          # search path and opening the file it finds, so either would work
+          # for the kernel, but a hard link needs no target resolution in the
+          # standalone readers and cannot dangle if a tree is ever moved. Both
+          # image formats preserve them -- UFS natively, hsfs through Rock
+          # Ridge -- which is the same property the staged closure relies on.
+          #
+          # Measured saving: 4.47MB of tree, 5MiB off the finished UFS image
+          # (564133888 against 569376768 bytes). It was ~35MB when this was
+          # written, of which `ip` alone was 32.5MB; the modules have since
+          # been stripped in nixpkgs and `ip` is now 2.7MB, so most of what
+          # this recovered was debug information that no longer exists. The
+          # pass is kept because the *ratio* is what it is -- every alias
+          # doubles, whatever the modules happen to weigh -- and because it
+          # costs one find(1) at build time.
+          find ba/kernel ba/platform ba/usr -type f -links 1 -size +64k -print0 \
+            | xargs -0 sha256sum \
+            | sort \
+            | awk '{ h = $1; sub(/^[0-9a-f]+  /, ""); if (h == ph) print pf "\n" $0; else pf = $0; ph = h }' \
+            | while read -r first && read -r dup; do
+                ln -f "$first" "$dup"
+              done
 
           # `mach` is in this list for a reason worth writing down, because its
           # absence costs a day. It names the platform-support modules

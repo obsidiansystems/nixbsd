@@ -412,7 +412,30 @@ in
           # stub, not a loadable module.)
           cp -RL --no-preserve=mode ${kernel}/kernel ${kernel}/platform ${kernel}/usr ba/
 
-          for f in name_to_sysnum minor_perm driver_classes dacf.conf; do
+          # `mach` is in this list for a reason worth writing down, because its
+          # absence costs a day. It names the platform-support modules
+          # psm_modload() will try -- pcplusmp, apix, xpv_psm -- and it is not
+          # optional scaffolding: psm_get_impl_module() on its own only ever
+          # offers DEFAULT_PSM_MODULE, which is `uppc`, and open_mach_list()
+          # (uts/common/os/modsysfile.c) reads this file for everything else.
+          #
+          # So with no /etc/mach the machine silently comes up on uppc: the
+          # plain 8259 fallback, with no I/O APIC. A PCI interrupt then has to
+          # be routed through an ACPI PCI link device, whose _SRS method fails
+          # under qemu, and every PCI driver's attach(9E) unwinds *after* it
+          # has already registered:
+          #
+          #     uppc: WARNING: psm: set_irq: _SRS failed
+          #     mac: NOTICE: vioif0 registered
+          #     mac: NOTICE: vioif0 unregistered
+          #
+          # which leaves the devinfo node bound to its driver but
+          # DI_DRIVER_DETACHED -- from userland indistinguishable from a driver
+          # that was never built at all. The giveaway is that *every* PCI
+          # driver fails identically, which no device-specific explanation
+          # covers. The modules themselves were always here; nothing was ever
+          # offered the chance to probe them.
+          for f in name_to_sysnum minor_perm driver_classes dacf.conf mach; do
             cp ${gate}/usr/src/uts/intel/os/$f ba/etc/
           done
           cp ${pkgs.writeText "driver_aliases" cfg.driverAliases} ba/etc/driver_aliases

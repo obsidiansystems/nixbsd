@@ -334,6 +334,39 @@ in
     # and name resolution is too far down for that: it has to work before
     # anything has demonstrated the store is readable.
     boot.illumos.bootArchive.files = {
+      # Keep the NIC attached once it has attached once.
+      #
+      # `vioif` binds to the device and `vioif_attach` runs to completion --
+      # instance 0 assigned, interrupts enabled, mac_register successful, no
+      # diagnostic of any kind:
+      #
+      #     mac: NOTICE: vioif0 registered
+      #     mac: NOTICE: vioif0 unregistered      <- two ticks later
+      #
+      # The detach is not a failure. Nothing holds a reference, so the DDI
+      # reclaims the instance as soon as whatever provoked the attach lets go
+      # (a `DINFOFORCE` devinfo snapshot does exactly this: it holds the
+      # driver, attaches every instance, snapshots, then releases).
+      #
+      # That is circular for a NIC being brought up by hand. `dlpi_open()`
+      # wants /dev/net/vioif0, falls back to /dev/vioif0, then to style-2
+      # /dev/vioif -- and all three need a minor node, which needs the driver
+      # attached. On a complete system the thing that holds it is the datalink,
+      # but the datalink is created lazily by `dls_devnet_hold_by_name()`,
+      # which is the very lookup that cannot complete. So the device attaches,
+      # is reclaimed, and every attempt to use it reports:
+      #
+      #     ifconfig: cannot plumb vioif0: Could not open DLPI link
+      #
+      # `ddi-forceattach` breaks the cycle the way illumos intends: the driver
+      # is attached during boot and is not subject to autodetach. Several
+      # in-gate drivers ship exactly this (ehci.conf, ohci.conf, xhci.conf,
+      # pcic.conf) for the same reason -- a device that must be present
+      # regardless of whether anyone has opened it yet.
+      "kernel/drv/vioif.conf" = ''
+        ddi-forceattach=1;
+      '';
+
       "etc/nsswitch.conf" = ''
         passwd:     files
         group:      files
@@ -361,6 +394,56 @@ in
       # root's shell is the staged closure's bash, reachable as /bin/sh through
       # the `bin` symlink above. uid 0 with home / keeps this independent of
       # whether /root exists in the archive.
+      # nsswitch.conf has said `hosts: files` since the beginning, and there
+      # has never been a file for it to read. `getipnodebyname()` is how
+      # ifconfig turns its argument into an address -- with flags 0, so it
+      # goes through the switch rather than parsing numerically first -- and
+      # with no backing file it fails even for a literal dotted quad:
+      #
+      #     ifconfig: 10.0.2.15: bad address
+      #
+      # which reads as a syntax complaint about an address that is obviously
+      # well formed.
+      #
+      # `loghost` is in the stock file too: syslogd resolves it, and its
+      # absence is a boot-time delay rather than an error.
+      "etc/hosts" = ''
+        ::1             localhost
+        127.0.0.1       localhost loghost
+      '';
+
+      # ...and the same table again under the name the *other* database uses.
+      # netdb.h has two paths, and they are not the same file:
+      #
+      #     #define _PATH_HOSTS    "/etc/hosts"
+      #     #define _PATH_IPNODES  "/etc/inet/ipnodes"
+      #
+      # `getipnodebyname()` -- which is what ifconfig calls to turn its
+      # argument into an address -- resolves through `ipnodes`, not `hosts`.
+      # So staging only /etc/hosts fixes the `hosts` database and leaves
+      # ifconfig exactly as broken as before.
+      #
+      # On a stock install these are the same bytes: /etc/inet/hosts is the
+      # real file, /etc/hosts is a symlink to it, and ipnodes sits beside it.
+      # Written out three times here rather than symlinked, because the
+      # archive builder stages plain files and the duplication is four lines.
+      "etc/inet/ipnodes" = ''
+        ::1             localhost
+        127.0.0.1       localhost loghost
+      '';
+
+      "etc/inet/hosts" = ''
+        ::1             localhost
+        127.0.0.1       localhost loghost
+      '';
+
+      # Likewise: `netmasks: files` with no file. Only consulted for classful
+      # fallback when no netmask is given, but it is one line and it removes
+      # the second half of the same failure.
+      "etc/netmasks" = ''
+        10.0.2.0        255.255.255.0
+      '';
+
       "etc/passwd" = ''
         root:x:0:0:Super-User:/:/bin/sh
         daemon:x:1:1::/:

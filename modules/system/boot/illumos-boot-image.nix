@@ -48,6 +48,39 @@
 # appearing twice in the `multiboot` line; without the repeat krtld goes
 # looking for a module called `-B`.
 #
+# qemu can load a multiboot kernel itself -- `-kernel unix -initrd "archive
+# type=rootfs"` -- and it is very tempting, because it copies the archive from
+# the host at memory speed and skips both GRUB and the emulated boot device:
+# measured, `unix` is entered 0.65s after qemu starts instead of 8.8s. It does
+# not work, and the reason is worth writing down so nobody spends another
+# afternoon on it.
+#
+# It gets impressively far. whoami comes out right by luck: fakebop takes the
+# first word of the command line, and qemu prepends the *host* path of the
+# -kernel file, but fakebop then strips everything before "/platform/"
+# (fakebop.c:1707) and the kernel derivation lays its output out as
+# $out/platform/i86pc/kernel/amd64/unix, so the store path reduces to exactly
+# the right thing. dboot finds the module, parses `type=rootfs`, and sets
+# ramdisk_start/ramdisk_end. Then vfs_mountroot() says
+#
+#     NOTICE: mount: not a UFS magic number (0x0)
+#
+# because the module is not page aligned. qemu loads modules at page-aligned
+# *offsets* from the kernel's multiboot load address (hw/i386/multiboot.c:288,
+# `mbs.mb_buf_phys = mh_load_addr`), and illumos' load_addr is 0xbffea8 -- the
+# ELF headers are 0x158 bytes and the first PT_LOAD sits at 0xc00000, so the
+# file as a whole loads 0x158 below a page boundary and every module inherits
+# that. GRUB page-aligns modules independently, which is what unix's multiboot
+# header asks for and what qemu ignores.
+#
+# It is fatal rather than cosmetic because ramdisk(4D) addresses its backing
+# store by page frame -- `pfn = btop(rsp->rd_existing[i].phys + offset)`,
+# uts/common/io/ramdisk.c:478 -- so the low 0xea8 bytes are simply dropped and
+# the whole image reads shifted. There is no padding trick: the shift is in the
+# physical address of the module, not in its contents. Fixing it means either
+# qemu honouring MULTIBOOT_PAGE_ALIGN or illumos linking `unix` so that file
+# offset 0 lands on a page, and neither belongs here.
+#
 # How far this gets: dboot hands over, unix relocates itself, krtld links
 # genunix, startup_modules() loads the boot-time modules, setup_ddi() probes
 # the buses, vfs_mountroot() mounts hsfs on /ramdisk:a and then devfs, dev,
@@ -97,6 +130,10 @@ let
     else
       cfg.bootArchive.storePaths;
   closure = pkgs.buildPackages.closureInfo { inherit rootPaths; };
+
+  # Guest RAM, in MB. See the note above `system.build.vm`.
+  memMB =
+    config.virtualisation.memorySize or (if cfg.bootArchive.minimal then 2048 else 6144);
 in
 {
   options.boot.illumos = {
@@ -135,22 +172,41 @@ in
         everything else to be reached over virtio-fs once the guest has
         mounted the host's `/nix/store`.
 
-        Archive size is very nearly the whole of boot time, and not by a
+        Archive size is the largest single term in boot time, and not by a
         little. The archive is a multiboot module, so GRUB copies every byte
         of it into RAM before unix is entered, and the kernel's ramdisk *is*
-        that memory -- there is no demand paging and no second chance. That
-        one copy is ~26s with KVM and ~71s under TCG, and it is also what
-        forces `virtualisation.memorySize = 6144`: the image has to fit in RAM
+        that memory -- there is no demand paging and no second chance. It is
+        also what sets the guest's memory size: the image has to fit in RAM
         alongside everything else.
 
         Measured on `illumos-debug`, ISO size, which is what GRUB reads from:
 
           full closure   582662144 (556MiB)
-          minimal        205174784 (196MiB)   -- 65% smaller
+          minimal        165328896 (158MiB)
 
-        and the boot archive inside it, 569376768 against 191889408. The
-        residue is not slack: at 196MiB the archive is almost entirely the
+        and the boot archive inside it, 569376768 against 152043520. The
+        residue is not slack: at 157MiB the archive is almost entirely the
         kernel modules, which have to be there by construction.
+
+        For scale, the timed phases of a whole `illumos-minimal` boot to a
+        shell (KVM, one vCPU) after the boot-device and menu changes below:
+
+          qemu + virtiofsd start        0.28s
+          GRUB reads the image          1.46s   <- this option
+          unix entered -> init exec'd   3.03s   (~1.3s of it is console
+                                                 output: 412 kmem_alloc
+                                                 warnings at ~3ms each)
+          /etc/profile                  0.10s   (devfsadm 42ms, soconfig 8ms,
+                                                 mountvfs 3ms -- nothing here)
+                                        -----
+                                        ~4.9s   (5-6s under host load; the
+                                                 kernel phase is what varies)
+
+        So the next real win here is a smaller archive, not a faster loader:
+        what remains is 126MB of DEBUG kernel modules staged unconditionally.
+        Staging only the ones needed before the virtio-fs mount would be worth
+        seconds, and is not done because a hand-picked module list that is
+        subtly wrong fails a long way from where it was written.
 
         The trade is a bootstrap problem, which is the whole reason this is an
         option rather than the default. Whatever performs the mount cannot
@@ -928,17 +984,73 @@ in
                 #
                 # The slack is NOT free, which is why it is this tight. The
                 # archive is a ramdisk -- the whole image is loaded into memory
-                # at boot and GRUB copies every byte of it first -- so
-                # over-sizing costs RAM and boot time directly. Measured
-                # overhead on the current tree is about 8% (a 1.11GB tree left
-                # 493MB free in a 1.7GB image), so a fifth plus 32MB leaves a
-                # comfortable margin without doubling the memory footprint.
+                # at boot and the loader copies every byte of it first -- so
+                # over-sizing costs RAM and boot time directly, at a measured
+                # ~43ms per megabyte read off the boot device.
+                #
+                # This is a search, not a formula, and it is a search because
+                # every fixed formula tried so far has been wrong at one end of
+                # the range or the other:
+                #
+                #   * a fifth plus 32MB was far too generous at the small end:
+                #     on `illumos-minimal` it turned a 126MB tree into a 183MB
+                #     image, 57MB (45%) of nothing, which is ~2.4s of boot;
+                #   * a twentieth plus 12MB fixed that (144MB, and minimal
+                #     boots) and was too tight at the large end -- both
+                #     `illumos-base` (356MB of data, 385MB image) and
+                #     `illumos-debug` (422MB, 455MB) died with
+                #
+                #         mkfs: populate: filesystem is full. Make the image
+                #         larger.
+                #
+                # The reason no single percentage works is that the overhead is
+                # not proportional to the data. UFS rounds every file's tail up
+                # to a fragment and spends an inode on it, so the waste is
+                # roughly constant *per file* -- and a nix store closure is an
+                # enormous number of very small files and symlinks, so the
+                # per-file term dominates for a big closure and is negligible
+                # for a tree that is mostly kernel modules.
+                #
+                # A per-file term would model that, but it needs a constant
+                # too, and the constant would then be the thing that is wrong
+                # in the next configuration. So: start from an estimate that
+                # includes both terms, and if mkfs says it does not fit, grow
+                # and try again. mkfs is loud and non-destructive when it runs
+                # out -- it fails the build rather than truncating anything --
+                # which is exactly what makes retrying safe.
+                #
+                # The cost is bounded: a couple of extra mkfs runs at build
+                # time, and none at all when the first estimate holds. What it
+                # buys is that the image stays as small as it can be, which is
+                # boot time and guest RAM directly, at a measured ~43ms per
+                # megabyte read off the boot device.
                 kb=$(du -sk --apparent-size ba | cut -f1)
-                mb=$(( kb / 1024 * 6 / 5 + 32 ))
-                echo "boot archive tree is ''${kb}KB; making a ''${mb}MB UFS image"
+                nfiles=$(find ba | wc -l)
 
-                truncate -s ''${mb}M $out
-                mkfs_ufs -F ufs -R ba $out $(( mb * 2048 ))
+                # Data, plus one fragment (1KB) per file for the tails, plus a
+                # twentieth for cylinder-group metadata and inode blocks, plus
+                # a floor so that a tiny tree still has somewhere to put its
+                # superblock.
+                mb=$(( (kb + nfiles) / 1024 * 21 / 20 + 8 ))
+                echo "boot archive tree is ''${kb}KB in ''${nfiles} files"
+
+                for attempt in 1 2 3 4 5; do
+                  echo "making a ''${mb}MB UFS image (attempt $attempt)"
+                  rm -f $out
+                  truncate -s ''${mb}M $out
+                  if mkfs_ufs -F ufs -R ba $out $(( mb * 2048 )); then
+                    break
+                  fi
+                  if [ "$attempt" = 5 ]; then
+                    echo "mkfs could not fit the tree in ''${mb}MB after 5 tries" >&2
+                    exit 1
+                  fi
+                  # A fifth at a time: big enough to converge in one or two
+                  # steps from any estimate that was merely optimistic, small
+                  # enough that converging does not itself waste the space the
+                  # search exists to save.
+                  mb=$(( mb * 6 / 5 ))
+                done
               ''
             else
               ''
@@ -982,11 +1094,19 @@ in
           cp ${kernel}/platform/i86pc/kernel/amd64/unix \
              iso/platform/i86pc/kernel/amd64/unix
 
+          # `timeout=0` boots the single entry immediately. It was 1, which
+          # cost a measured 1.07s of every boot -- GRUB spends the whole
+          # countdown redrawing the menu over a 115200-baud serial line, so the
+          # "1 second" is really the second plus the drawing. There is one
+          # menuentry and nothing to choose between, so the menu bought
+          # nothing; to get it back for a one-off, edit here or press a key
+          # (GRUB still reads stdin, which is why anything piped into the
+          # console before the kernel starts is still swallowed).
           cat >iso/boot/grub/grub.cfg <<'EOF'
           serial --unit=0 --speed=115200
           terminal_input serial console
           terminal_output serial console
-          set timeout=1
+          set timeout=0
           set default=0
           menuentry "illumos" {
               multiboot /platform/i86pc/kernel/amd64/unix /platform/i86pc/kernel/amd64/unix ${cfg.kernelArgs}
@@ -1009,6 +1129,19 @@ in
     # module: GRUB loads the whole thing into RAM and the kernel's ramdisk
     # device *is* that memory, so the VM needs the archive's full size on top
     # of everything else.
+    #
+    # Which is why `minimal` gets a different number rather than one being
+    # chosen for both. 6144 was picked when the archive was ~1GB; under
+    # `minimal` it is ~145MB and 2048 is measured to be *faster* than 6144
+    # (5.86s to the virtio-fs mount against 6.03-6.10s) as well as six times
+    # cheaper on the host. 1024 is not: at that size the archive plus the
+    # kernel puts the guest under memory pressure and boot goes to ~12s, which
+    # is worse than where this started. So this is a floor, not a knob to keep
+    # turning down.
+    #
+    # The full closure still needs the large number and has not been
+    # re-measured with it; do not collapse these to one value without booting
+    # `illumos-full`.
     system.build.vm = lib.mkForce (
       pkgs.buildPackages.writeShellScriptBin "run-${config.system.name}-vm" ''
         # `accel=kvm:tcg` is qemu's own fallback list: use KVM when /dev/kvm is
@@ -1106,16 +1239,43 @@ in
         # which plain -m does not give: hence memory-backend-memfd,share=on and
         # a numa node using it. Without this qemu refuses the device outright
         # ("failed to set up shared memory").
+        #
+        # The boot image is a virtio-blk disk, not `-cdrom`, and that is a
+        # measured 3.3s. GRUB reads the whole image through the BIOS before
+        # `unix` is entered -- the boot archive is a multiboot module -- so the
+        # speed of the emulated boot device is a first-order term in boot time.
+        # On `illumos-minimal` (a 183MB image) the same read costs:
+        #
+        #   -cdrom (SeaBIOS ATAPI)        8.81s
+        #   if=ide,media=disk            54.3s   -- do not
+        #   virtio-blk-pci,bootindex=0    5.48s
+        #   nvme                          never boots (this SeaBIOS has no
+        #                                 nvme support; no output at all)
+        #
+        # `if=virtio` without an explicit `bootindex` also produces no output:
+        # SeaBIOS finds nothing to boot and sits there, which reads exactly
+        # like a hung kernel. The bootindex is load-bearing.
+        #
+        # `snapshot=on` because the image is a store path and therefore
+        # read-only, and qemu refuses a writable drive it cannot open for
+        # write. Nothing writes to it; the overlay is discarded on exit.
+        #
+        # The cost of this is one spurious warning per boot -- the guest now
+        # sees a virtio-blk device and vioblk's attach(9E) fails on it
+        # ("Failed to map CAP 2 @ BAR4"). Nothing depends on that device: the
+        # root is the ramdisk. If that ever becomes confusing, the honest fix
+        # is to make vioblk work, not to go back to the CD.
         exec ${pkgs.buildPackages.qemu}/bin/qemu-system-x86_64 \
           -display none -no-reboot \
           -machine accel=kvm:tcg,memory-backend=mem0 -cpu max \
-          -m ${toString (config.virtualisation.memorySize or 6144)} \
-          -object memory-backend-memfd,id=mem0,size=${toString (config.virtualisation.memorySize or 6144)}M,share=on \
+          -m ${toString memMB} \
+          -object memory-backend-memfd,id=mem0,size=${toString memMB}M,share=on \
           -smp ${toString (config.virtualisation.cores or 1)} \
           -nic user,model=virtio-net-pci,hostfwd=tcp::"$port"-:22 \
           -chardev socket,id=vfs0,path="$vfsdir/vfs.sock" \
           -device vhost-user-fs-pci,chardev=vfs0,tag=store \
-          -cdrom ${config.system.build.illumosImage} \
+          -drive file=${config.system.build.illumosImage},format=raw,if=none,id=boot0,snapshot=on \
+          -device virtio-blk-pci,drive=boot0,bootindex=0 \
           -serial mon:stdio "$@"
       ''
     );

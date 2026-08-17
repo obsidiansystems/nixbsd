@@ -573,6 +573,24 @@ in
           for f in name_to_sysnum minor_perm driver_classes dacf.conf mach; do
             cp ${gate}/usr/src/uts/intel/os/$f ba/etc/
           done
+          # /etc/netconfig is the transport-selection table libnsl reads via
+          # getnetconfig(3NSL): it maps a name like `tcp` onto a semantics, a
+          # protocol family and the STREAMS device to push (/dev/tcp). Anything
+          # built on TI-RPC consults it, which for us means the NFS mount
+          # helper.
+          #
+          # Its absence does not look like a missing file. mount(8) resolves
+          # `-o proto=tcp` through the NETPATH machinery, finds no netconfig
+          # entries at all, and reports
+          #
+          #     nfs mount: 10.0.2.2: Error in NETPATH.
+          #
+          # which reads like a routing or server problem and is neither -- no
+          # packet is ever sent. Same shape as /etc/mach and /etc/sock2path.d
+          # above: a data file the kernel and libraries assume any real install
+          # has, invisible until the one subsystem that needs it runs.
+          cp ${gate}/usr/src/cmd/netfiles/netconfig ba/etc/netconfig
+
           cp ${pkgs.writeText "driver_aliases" cfg.driverAliases} ba/etc/driver_aliases
           : >ba/etc/system
           : >ba/etc/mnttab

@@ -77,6 +77,15 @@
     #     ditree
     #     wait; cat /tmp/k.out
     (pkgs.illumos.klog or null)
+
+    # Loads the socket-to-transport mappings into sockfs. Without it every
+    # AF_INET socket fails at creation -- `ifconfig -a` cannot even open one,
+    # before naming any interface -- so nothing about networking is testable
+    # and the failure looks like a driver problem. Must run *after* devfsadm,
+    # since some mappings name /dev entries devfsadm creates:
+    #
+    #     soconfig -d <this package>/etc/sock2path.d
+    (pkgs.illumos.soconfig or null)
   ]);
 
   # Break the deadlock between devfsadm and the read-only root.

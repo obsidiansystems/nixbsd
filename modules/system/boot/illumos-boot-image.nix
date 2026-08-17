@@ -614,17 +614,45 @@ in
         # mac_register() we can see succeed, so vioif is the one with a chance
         # of coming up. Change the model here to test the other path.
         #
-        # `hostfwd` puts the guest's port 22 on localhost:2222, so that once an
-        # address is plumbed `ssh -p 2222 root@localhost` reaches it. Nothing
-        # plumbs one yet: `ifconfig` links libdladm and libipadm, neither of
-        # which is packaged, so this is the host half of a path whose guest
-        # half is still missing.
+        # `hostfwd` forwards the guest's port 22 to a host port, so that once an
+        # address is plumbed `ssh -p <port> root@localhost` reaches it.
+        #
+        # The port is chosen at random rather than fixed at 2222 so that
+        # several of these can run at once. A fixed port means the second VM
+        # dies at startup with
+        #
+        #     Could not set up host forwarding rule 'tcp::2222-:22'
+        #
+        # which produces a ~100-byte log and looks exactly like a boot failure
+        # -- it cost three debugging runs before it was recognised. Set
+        # $ILLUMOS_SSH_PORT to pin it when you want a predictable number.
+        #
+        # Freeness is checked against /proc/net/tcp{,6} in pure bash, because
+        # this script has no PATH to speak of and pulling in ss(8) or python
+        # for one lookup is not worth it. The check is advisory: something else
+        # could still take the port in the moment between looking and binding,
+        # which is why it retries rather than trusting the first answer.
+        port=''${ILLUMOS_SSH_PORT:-}
+        if [ -z "$port" ]; then
+          for _ in $(seq 1 50); do
+            cand=$(( 20000 + RANDOM % 20000 ))
+            printf -v hex ':%04X' "$cand"
+            inuse=
+            while read -r _ local _; do
+              case "$local" in *"$hex") inuse=1; break;; esac
+            done < <(cat /proc/net/tcp /proc/net/tcp6 2>/dev/null)
+            [ -z "$inuse" ] && { port=$cand; break; }
+          done
+          : "''${port:=2222}"
+        fi
+        echo "illumos VM: guest ssh port 22 -> localhost:$port" >&2
+
         exec ${pkgs.buildPackages.qemu}/bin/qemu-system-x86_64 \
           -display none -no-reboot \
           -machine accel=kvm:tcg -cpu max \
           -m ${toString (config.virtualisation.memorySize or 6144)} \
           -smp ${toString (config.virtualisation.cores or 1)} \
-          -nic user,model=virtio-net-pci,hostfwd=tcp::2222-:22 \
+          -nic user,model=virtio-net-pci,hostfwd=tcp::"$port"-:22 \
           -cdrom ${config.system.build.illumosImage} \
           -serial mon:stdio "$@"
       ''

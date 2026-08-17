@@ -60,6 +60,11 @@
     # Assigns an address. qemu's SLIRP hands out fixed ones: guest 10.0.2.15,
     # host 10.0.2.2, /24.
     (pkgs.illumos.ifconfig or null)
+
+    # Walks the devinfo tree and prints each node's driver binding and
+    # state. devfs hides unattached nodes, so this is the only way from
+    # userland to tell "device absent" from "driver bound, attach failed".
+    (pkgs.illumos.ditree or null)
   ]);
 
   # Break the deadlock between devfsadm and the read-only root.

@@ -123,6 +123,10 @@
     # objects, respectively). This does the three ioctls directly.
     (pkgs.illumos.setaddr or null)
 
+    # mount -F nfs, for serving /nix/store from the host read-only instead of
+    # baking a UFS image per build and copying it into RAM per boot.
+    (pkgs.illumos.mount-nfs or null)
+
     # sshd, the actual objective. nixpkgs builds openssh with `withPAM`
     # defaulting to `isLinux`, so this is a *non*-PAM build: it authenticates
     # against /etc/shadow through getpwnam/getspnam, which is why nss-files
@@ -200,4 +204,59 @@
     # stays unstaged rather than being worked around.
     "etc/devlink.tab" = "${pkgs.illumos.devfsadm}/etc/devlink.tab";
   };
+
+  # Bring the network up at boot, so the machine is reachable by ssh without
+  # anyone typing anything.
+  #
+  # `init-shell` starts bash as a *login* shell, so /etc/profile is the only
+  # hook there is: this configuration has bash as pid 1, so there is no
+  # profile, no service manager and nothing between the kernel exec'ing init
+  # and a prompt. Everything below was determined by hand and the ordering is
+  # not guessable -- see the sequence documented above.
+  #
+  # This is deliberately *not* how it should end up. The right home for all of
+  # it is illumos-smf.nix as svc:/network/physical and svc:/network/ssh, with
+  # real dependencies instead of `sleep`. It lives here because the SMF path
+  # needs the full configuration, which costs a 1.3GB archive and a long boot
+  # per iteration, and because having it working somewhere is what makes
+  # moving it a refactor rather than a fresh investigation.
+  boot.illumos.bootArchive.files."etc/profile" =
+    let
+      p = n: pkgs.illumos.${n} or null;
+      have = builtins.all (x: x != null) [
+        (p "devfsadm") (p "soconfig") (p "dlmgmtd") (p "ifconfig")
+        (p "setaddr") (p "mount-ufs")
+      ];
+    in
+    lib.mkIf have ''
+      # The root is mounted read-only by ufs_mountroot(); sdev's backing store
+      # is the root filesystem, so until this runs devfsadm cannot create nodes
+      # and /etc cannot be written.
+      ${p "mount-ufs"}/lib/fs/ufs/mount -o remount,rw /devices/ramdisk:a / \
+          >/dev/null 2>&1
+
+      # devfsadm keeps its lock behind the /etc/dev symlink; `mkdir -p
+      # /etc/dev` follows the link and does *not* create the target.
+      mkdir -p /etc/svc/volatile/dev /etc/dladm /var/run /var/empty
+      ${p "devfsadm"}/sbin/devfsadm 2>/dev/null
+
+      # Without the socket-to-transport mappings, socket(AF_INET, ...) fails
+      # outright and nothing about networking is possible.
+      ${p "soconfig"}/bin/soconfig -d ${p "soconfig"}/etc/sock2path.d 2>/dev/null
+
+      # dlmgmtd needs a writable copy of its database, and refuses to start
+      # unless SMF_FMRI is set -- it derives its cache file name from the FMRI,
+      # and says so only to syslog, which nothing here reads.
+      cp ${p "dlmgmtd"}/share/dlmgmtd/datalink.conf /etc/dladm/datalink.conf
+      chmod 644 /etc/dladm/datalink.conf
+      SMF_FMRI=svc:/network/datalink-management:default \
+          ${p "dlmgmtd"}/bin/dlmgmtd
+
+      # The NIC is already attached and held by net_dacf, so this only has to
+      # plumb it. `setaddr` rather than ifconfig for the address: ifconfig
+      # resolves even a literal dotted quad through the name service switch,
+      # and the hosts backend does not work here.
+      ${p "ifconfig"}/sbin/ifconfig vioif0 plumb 2>/dev/null
+      ${p "setaddr"}/bin/setaddr vioif0 10.0.2.15 255.255.255.0
+    '';
 }

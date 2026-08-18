@@ -52,9 +52,10 @@
 # qemu can load a multiboot kernel itself -- `-kernel unix -initrd "archive
 # type=rootfs"` -- and it is very tempting, because it copies the archive from
 # the host at memory speed and skips both GRUB and the emulated boot device:
-# measured, `unix` is entered 0.65s after qemu starts instead of 8.8s. It does
-# not work, and the reason is worth writing down so nobody spends another
-# afternoon on it.
+# measured, `unix` is entered 0.65s after qemu starts instead of 8.8s. It needs
+# one qemu patch to work at all, and that patch now exists, so this is a real
+# option: `boot.illumos.directKernelBoot`. The GRUB ISO remains the default and
+# the fallback. The reason for the patch is worth writing down.
 #
 # It gets impressively far. whoami comes out right by luck: fakebop takes the
 # first word of the command line, and qemu prepends the *host* path of the
@@ -78,9 +79,10 @@
 # store by page frame -- `pfn = btop(rsp->rd_existing[i].phys + offset)`,
 # uts/common/io/ramdisk.c:478 -- so the low 0xea8 bytes are simply dropped and
 # the whole image reads shifted. There is no padding trick: the shift is in the
-# physical address of the module, not in its contents. Fixing it means either
-# qemu honouring MULTIBOOT_PAGE_ALIGN or illumos linking `unix` so that file
-# offset 0 lands on a page, and neither belongs here.
+# physical address of the module, not in its contents. The fix is qemu honouring
+# MULTIBOOT_PAGE_ALIGN, which nixpkgs now carries locally as
+# pkgs/by-name/qe/qemu/multiboot-page-align-modules.patch; with that in
+# `pkgs.buildPackages.qemu` the ramdisk mounts and the machine boots normally.
 #
 # How far this gets: dboot hands over, unix relocates itself, krtld links
 # genunix, startup_modules() loads the boot-time modules, setup_ddi() probes
@@ -933,6 +935,40 @@ in
         It also costs more memory than hsfs: the archive is a ramdisk, so the
         whole image is loaded at boot, and a UFS image is larger than the
         equivalent ISO.
+      '';
+    };
+
+    directKernelBoot = mkOption {
+      type = types.bool;
+      default = false;
+      description = ''
+        Boot `system.build.vm` with qemu's own multiboot loader
+        (`-kernel unix -initrd "boot_archive type=rootfs"`) instead of booting
+        the GRUB rescue ISO off an emulated disk.
+
+        qemu copies both images straight from the host into guest memory, so
+        this skips SeaBIOS, GRUB and the emulated boot device entirely.
+        Measured on `illumos-full-virtiofs`, kernel entry drops from ~5.9s to
+        ~2.9s after qemu starts.
+
+        Off by default because it depends on a qemu patch that nixpkgs carries
+        locally (`pkgs/by-name/qe/qemu/multiboot-page-align-modules.patch`).
+        qemu places multiboot modules at page-aligned *offsets* from the
+        kernel's load address rather than at page-aligned physical addresses,
+        and illumos' `unix` loads at 0xbffea8, so without the patch every
+        module -- including the boot archive -- lands 0xea8 below a page
+        boundary. ramdisk(4D) addresses its backing store by page frame
+        (uts/common/io/ramdisk.c:478), so the image reads shifted and
+        vfs_mountroot() reports
+
+            NOTICE: mount: not a UFS magic number (0x0)
+
+        There is no padding trick: the shift is in the module's physical
+        address, not in its contents. If you see that message, the qemu in
+        `pkgs.buildPackages.qemu` does not carry the patch; turn this back off.
+
+        `system.build.illumosImage` is still built either way, so the ISO path
+        remains available as the fallback.
       '';
     };
 
@@ -2342,8 +2378,17 @@ in
           -nic user,model=virtio-net-pci,hostfwd=tcp::"$port"-:22 \
           -chardev socket,id=vfs0,path="$vfsdir/vfs.sock" \
           -device vhost-user-fs-pci,chardev=vfs0,tag=store \
-          -drive file=${config.system.build.illumosImage},format=raw,if=none,id=boot0,snapshot=on \
-          -device virtio-blk-pci,drive=boot0,bootindex=0 \
+          ${
+            if cfg.directKernelBoot then
+              ''
+                -kernel ${kernel}/platform/i86pc/kernel/amd64/unix \
+                          -append "${cfg.kernelArgs}" \
+                          -initrd "${config.system.build.bootArchive} type=rootfs"''
+            else
+              ''
+                -drive file=${config.system.build.illumosImage},format=raw,if=none,id=boot0,snapshot=on \
+                          -device virtio-blk-pci,drive=boot0,bootindex=0''
+          } \
           -serial mon:stdio "$@"
       ''
     );

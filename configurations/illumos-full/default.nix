@@ -138,15 +138,25 @@
   # could run. They are folded in here instead: the manifests still get
   # rendered, and now there is an SMF to import them into.
   #
-  # What still does not work is reaching them, though the reason has moved.
-  # `illumos.ifconfig` is packaged now, on top of libdladm and libipadm, so
-  # there is finally something that *could* assign an address. The obstacle is
-  # one level lower: in the VM `/devices/pci@0,0/` contains only `isa@1`, so
-  # the virtio NIC is not enumerated and there is no link to plumb. Until that
-  # is understood, ifconfig has nothing to configure. (`e1000g` is also built,
-  # but its attach(9E) unwinds silently after a mac_register() that can be seen
-  # to succeed, which is why the VM asks for virtio instead. See nixpkgs'
-  # illumos `unix.nix`.)
+  # The NIC does come up now, and the note that used to stand here -- that
+  # `/devices/pci@0,0/` contained only `isa@1`, so the virtio NIC was never
+  # enumerated -- was wrong, or had stopped being true. The device is there and
+  # attached, minor node and all:
+  #
+  #     illumos# ls /devices/pci@0,0
+  #     isa@1  pci1af4,1100@4  pci1af4,1@3  pci1af4,1@3:vioif0
+  #
+  # What was missing was two daemons, not a driver. Neither libdladm nor
+  # libipadm reads state from the kernel: each asks a daemon over a door, and
+  # with no daemon the lookup fails before anything touches the hardware --
+  # `dlmgmtd` for `ifconfig <if> plumb` ("Interface does not exist") and
+  # `ipmgmtd` for the address ("could not create address:Object not found").
+  # Both are now started from
+  # ../../modules/system/boot/illumos-smf.nix, ahead of `network/physical`.
+  #
+  # (`e1000g` is also built, but its attach(9E) unwinds silently after a
+  # mac_register() that can be seen to succeed, which is why the VM asks for
+  # virtio instead. See nixpkgs' illumos `unix.nix`.)
   services.sshd.enable = lib.mkForce true;
 
   # The host keys have to live somewhere writable. The default paths are under
@@ -193,7 +203,54 @@
   boot.illumos.bootArchive.symlinks = {
     "etc/ssh/sshd_config" = "${config.environment.etc."ssh/sshd_config".source}";
     "etc/ssh/moduli" = "${config.environment.etc."ssh/moduli".source}";
+
   };
+
+  # root's authorized keys, and note this is `files` -- a real file in the
+  # archive -- where sshd_config and moduli just above are symlinks into the
+  # store. That difference is load-bearing, and it cost a while to find.
+  #
+  # sshd applies StrictModes to the authorized_keys file *and to every
+  # directory on the path to it*, rejecting any component that is group- or
+  # world-writable. Here the store is a virtio-fs export of the host's
+  # /nix/store, which is
+  #
+  #     drwxrwxr-t 30163 root nixbld ... /nix/store
+  #
+  # -- group-writable by `nixbld`, as it must be for the host's daemon to
+  # build in it. So a symlink into the store fails the check for a reason that
+  # has nothing to do with this guest at all, and sshd reports the result as
+  #
+  #     root@127.0.0.1: Permission denied (publickey,password,...)
+  #
+  # which is indistinguishable from simply presenting the wrong key. Confirmed
+  # by hand on a booted guest: copying the identical bytes to a root-owned file
+  # on the ramdisk root turned that same rejected login into `uid=0(root)`.
+  #
+  # Read at evaluation time out of the file the sshd module already generates
+  # (`authKeysFiles` in modules/services/networking/ssh/sshd.nix), so the key
+  # itself is still declared once, as
+  # `users.users.root.openssh.authorizedKeys.keys` below.
+  boot.illumos.bootArchive.files."etc/ssh/authorized_keys.d/root" =
+    builtins.readFile
+      config.environment.etc."ssh/authorized_keys.d/root".source;
+
+  # The key half of "sshd as a real SMF service": a daemon that comes online
+  # and admits nobody has not demonstrated much.
+  #
+  # This is the host-side key the VM probe harness uses
+  # (`scratchpad/vmkey`), so `ssh -i vmkey -p <fwd> root@127.0.0.1` is a
+  # complete end-to-end test of the NIC, the IP stack, sockfs, SMF starting
+  # the service, and the name-service switch behind the login.
+  users.users.root.openssh.authorizedKeys.keys = [
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPeQXRXRg993x1FcSMn6bZBZF3ckMn2+iZOhenMpX92k jcericson@jcericson-2023-nixos"
+  ];
+
+  # Root is the only account on this system, so refusing root logins refuses
+  # all of them. `prohibit-password` rather than `yes`: /etc/shadow carries
+  # `NP` for root, so there is no password to offer in any case, and this says
+  # so explicitly rather than relying on it.
+  services.openssh.settings.PermitRootLogin = "prohibit-password";
 
   services.nginx = {
     enable = true;

@@ -522,7 +522,44 @@ main(int argc, char **argv)
 	 * is staged as a symlink by the boot archive builder.
 	 */
 	{
+		/*
+		 * The `-P` pass first, and it is not optional.
+		 *
+		 * `-P` means "load minor_perm and device_policy" -- devfsadm's
+		 * own comment on the flag -- and it is the ONLY thing that
+		 * calls load_dev_acl(). A bare `devfsadm` does neither, so
+		 * running it by hand to debug a permissions problem changes
+		 * nothing and makes the data files look innocent.
+		 *
+		 * Both halves matter, and the policy half is the surprising
+		 * one, because it is a privilege check entirely separate from
+		 * the mode bits. Until /etc/security/device_policy is loaded
+		 * the kernel's compiled-in default stands, and that default is
+		 *
+		 *	priv_fillset(&dfltpolicy->dp_rdp);
+		 *	priv_fillset(&dfltpolicy->dp_wrp);
+		 *
+		 * (uts/common/os/devpolicy.c:148) -- *all* privileges required
+		 * to open *any* device. Only a full-privilege process passes,
+		 * so everything works when tested as root while every daemon
+		 * that drops to its own user gets EACCES on a node whose
+		 * `ls -l` shows `crw-rw-rw-`. That combination sends you
+		 * looking for a permissions bug that was never one.
+		 *
+		 * nginx is how this was found: its worker setuids to `nginx`,
+		 * cannot open /dev/poll -- the only event method it is built
+		 * with on this platform -- and exits, while the master survives
+		 * holding the listen socket. SMF reports the service `online`,
+		 * port 80 accepts connections, and every one returns nothing.
+		 *
+		 * Before the populating run, necessarily: minor_perm is
+		 * consulted as nodes are created, so loading it afterwards
+		 * leaves everything already made at its default mode.
+		 */
+		char *const pav[] = { (char *)DEVFSADM, "-P", NULL };
 		char *const av[] = { (char *)DEVFSADM, NULL };
+
+		(void) run("devfsadm -P", DEVFSADM, pav, environ);
 		(void) run("devfsadm", DEVFSADM, av, environ);
 	}
 

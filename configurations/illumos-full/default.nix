@@ -266,7 +266,17 @@
     enable = true;
     virtualHosts."localhost" = {
       default = true;
-      root = ./.;
+      # A real docroot with a real index, rather than pointing at this
+      # directory: with no index file nginx answers 403 (autoindex is off by
+      # default), which looks exactly like the permission failure this
+      # configuration spent a while actually having, and is the last thing you
+      # want to see when checking whether nginx works.
+      root = pkgs.writeTextDir "index.html" ''
+        <!doctype html>
+        <title>nixbsd on illumos</title>
+        <h1>nginx is serving from illumos</h1>
+        <p>Cross-compiled from Linux by nixpkgs, running under SMF.</p>
+      '';
     };
   };
 

@@ -31,7 +31,31 @@ let
     NETWORKING = "svc:/milestone/network";
     netif = "svc:/network/physical";
     netwait = "svc:/milestone/network";
-    SERVERS = "svc:/milestone/single-user";
+    # `svc:/milestone/multi-user`, not single-user, and the difference is a
+    # dependency cycle rather than a nicety. rc(8) orders NETWORKING < SERVERS
+    # < DAEMON: SERVERS means "the network is up, servers may start", so it
+    # sits *after* the network, not before it. Mapping it onto single-user put
+    # it before, and nginx -- which declares `dependencies = [ "NETWORKING" ]`
+    # and `before = [ "SERVERS" ]`, the ordinary spelling for a network daemon
+    # -- came out as
+    #
+    #     after  svc:/milestone/network
+    #     before svc:/milestone/single-user
+    #
+    # while the milestone chain runs single-user -> ... -> network. startd saw
+    # that for what it was:
+    #
+    #     svc:/site/nginx:default (Nginx Web Server)
+    #      State: maintenance
+    #     Reason: Completes a dependency cycle.
+    #
+    # Collapsing SERVERS onto DAEMON's milestone loses the ordering *between*
+    # those two dummies, which is the hazard the note above warns about. That
+    # is the lesser evil here: nothing declares an edge between SERVERS and
+    # DAEMON, whereas the network edge is declared by every server there is.
+    # Splitting them again means a real milestone between network and
+    # multi-user for SERVERS to name.
+    SERVERS = "svc:/milestone/multi-user";
     DAEMON = "svc:/milestone/multi-user";
     LOGIN = "svc:/milestone/multi-user";
     sysctl = "svc:/system/identity";

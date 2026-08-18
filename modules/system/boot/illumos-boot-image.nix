@@ -118,6 +118,65 @@ let
   # $(ROOT).
   gate = pkgs.illumos.source;
 
+  # ------------------------------------------------------------------
+  # The /etc data files name kernel modules by bare name, and nothing at run
+  # time complains when one of those names is not a module that exists.
+  #
+  # `/etc/dacf.conf` rules and `/etc/driver_aliases` entries are both consulted
+  # opportunistically: mod_hold_by_name() on a module that is not there, or a
+  # bind that never matches a driver, is a silent no-op. The failure then
+  # appears layers away from the cause -- a devfs node that never turns up, a
+  # daemon that fails for what looks like an unrelated reason. That is exactly
+  # how `net_dacf` (a whole day) and `vtfs` were found. So check the names here,
+  # against what the kernel derivation says it actually built.
+  #
+  # `unix.nix` exports `passthru.kmodBaseNames` for this: bare module names
+  # (`intel/net_dacf` -> `net_dacf`), which is the right key because both the
+  # dacf.conf module field and the driver_aliases first field are bare.
+  builtKmods =
+    kernel.kmodBaseNames or (throw (
+      "boot.kernel.package (${kernel.name}) has no `passthru.kmodBaseNames`, "
+      + "so the /etc data files staged into the boot archive cannot be checked "
+      + "against the modules that were built. Export it from the kernel "
+      + "derivation (see pkgs/os-specific/illumos/pkgs/unix.nix)."
+    ));
+
+  # `unix.nix` builds `intel/foo` and installs it under whatever class its own
+  # Makefile says (drv, misc, strmod, dacf, ...), so the class cannot be
+  # reconstructed here -- and does not need to be. Neither data file names one.
+  kmodHint = name: "add \"intel/${name}\" (or the right platform directory) to `kmodNames`";
+
+  # /etc/driver_aliases: `<driver> "<alias>"`, one per line, driver first.
+  # Checked in Nix rather than in the builder because it is a module option --
+  # failing at evaluation names the option, not a store path.
+  driverAliasEntries = lib.filter (l: l != "" && !(lib.hasPrefix "#" l)) (
+    map (l: lib.head (lib.splitString "#" (lib.removeSuffix "\r" l))) (
+      lib.filter (l: lib.trim l != "") (lib.splitString "\n" cfg.driverAliases)
+    )
+  );
+  unknownAliasDrivers = lib.filter (e: !(lib.elem (lib.head (lib.splitString " " (lib.trim e))) builtKmods)) (
+    map lib.trim driverAliasEntries
+  );
+  checkedDriverAliases =
+    if unknownAliasDrivers == [ ] then
+      cfg.driverAliases
+    else
+      throw (
+        "boot.illumos.driverAliases names drivers which are not in the built "
+        + "kernel module set:\n"
+        + lib.concatMapStringsSep "\n" (
+          e:
+          let
+            drv = lib.head (lib.splitString " " e);
+          in
+          "  ${e}\n      -> no module named `${drv}`; ${kmodHint drv} in "
+          + "pkgs/os-specific/illumos/pkgs/unix.nix, or drop the line"
+        ) unknownAliasDrivers
+        + "\n\nA driver_aliases entry for a driver that was never built binds "
+        + "nothing, and an unbound devinfo node does not appear in devfs at "
+        + "all -- so the device reads as absent rather than as unbound."
+      );
+
   # The store paths staged into the archive, resolved on the build machine.
   #
   # `minimal` switches the *root set*; it does not filter the result. A closure
@@ -1608,6 +1667,39 @@ in
           for f in name_to_sysnum minor_perm driver_classes dacf.conf mach; do
             cp ${gate}/usr/src/uts/intel/os/$f ba/etc/
           done
+
+          # Every dacf rule's module must be a module that was built. See the
+          # `builtKmods` comment near the top of this file for why this is
+          # worth a build failure. Done here rather than in Nix because the
+          # file's contents come from the gate store path, and reading that at
+          # evaluation time would be import-from-derivation.
+          #
+          # Field 2 of a rule is `<module>:<opset>`; that is the only module
+          # name in the line. `pushmod="usbkbm"` deliberately is NOT checked:
+          # those STREAMS modules are pushed only if the rule ever fires, and
+          # the keyboard/mouse rules here are for hid devices this platform
+          # does not have.
+          dacfBad=$(awk -v mods=" ${lib.concatStringsSep " " builtKmods} " '
+            /^[ \t]*(#|$)/ { next }
+            {
+              split($2, f, ":")
+              if (index(mods, " " f[1] " ") == 0)
+                printf "  line %d: %s\n      -> no module named `%s`\n", FNR, $0, f[1]
+            }' ba/etc/dacf.conf)
+          if [ -n "$dacfBad" ]; then
+            {
+              echo "/etc/dacf.conf names kernel modules which are not in the built module set:"
+              echo "$dacfBad"
+              echo
+              echo "The file is ${gate}/usr/src/uts/intel/os/dacf.conf, staged verbatim."
+              echo "Fix by adding the module to \`kmodNames\` in"
+              echo "pkgs/os-specific/illumos/pkgs/unix.nix (entries look like \"intel/net_dacf\")."
+              echo
+              echo "A dacf rule whose module is absent is a silent no-op: the post-attach"
+              echo "hook never runs, and what you see is a device node that never appears."
+            } >&2
+            exit 1
+          fi
           # /etc/security/device_policy, from the same uts/intel/os directory.
           #
           # illumos enforces a privilege check on device open that is entirely
@@ -1682,7 +1774,9 @@ in
           # uncovered: fixing one revealed the next.
           cp ${gate}/usr/src/cmd/fs.d/nfs/etc/nfssec.conf ba/etc/nfssec.conf
 
-          cp ${pkgs.writeText "driver_aliases" cfg.driverAliases} ba/etc/driver_aliases
+          cp ${
+            pkgs.writeText "driver_aliases" checkedDriverAliases
+          } ba/etc/driver_aliases
           : >ba/etc/system
           : >ba/etc/mnttab
           echo '#' >ba/etc/path_to_inst

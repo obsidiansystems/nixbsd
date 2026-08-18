@@ -970,6 +970,7 @@ in
         sys:x:3:3::/:
         nobody:x:60001:60001:NFS Anonymous Access User:/:
         sshd:x:22:22:sshd privsep:/var/empty:/bin/false
+        nginx:x:65:65:nginx web server:/var/empty:/bin/false
         noaccess:x:60002:60002:No Access User:/:
       '';
 
@@ -1005,6 +1006,7 @@ in
         bin:NP:::::::
         sys:NP:::::::
         sshd:NP:::::::
+        nginx:NP:::::::
         nobody:*LK*:::::::
         noaccess:*LK*:::::::
       '';
@@ -1016,6 +1018,7 @@ in
         sys::3:root,bin,adm
         adm::4:root,daemon
         sshd::22:
+        nginx::65:
         nobody::60001:
         noaccess::60002:
       '';

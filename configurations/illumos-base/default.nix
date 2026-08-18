@@ -64,8 +64,6 @@
   services.fcron.enable = false;
   fonts.fontconfig.enable = false;
 
-  users.users.root.initialPassword = "toor";
-
   fileSystems."/" = {
     device = "/dev/dsk/c0t0d0s0";
     fsType = "ufs";

@@ -1000,6 +1000,16 @@ in
       # `NP` ("no password") is illumos' marker for an account that cannot be
       # logged into with a password but is not locked. The daemon accounts
       # below already carry it; it leaves key authentication alone.
+      #
+      # This literal string, not `users.users.*` / `update-users-groups.pl`,
+      # is the entire source of truth for illumos' `/etc/shadow`. That NixOS
+      # module writes a BSD-style `/etc/master.passwd` from
+      # `system.activationScripts.users`, and nothing on the illumos boot path
+      # ever runs `activationScripts` (illumos boots straight into SMF). So an
+      # option like `users.users.root.initialPassword` is silently a no-op
+      # here -- confirmed by booting and reading a live guest's `/etc/shadow`,
+      # which shows `NP` for root regardless. `illumos-base` used to set it to
+      # "toor"; that line was removed rather than left to lie.
       "etc/shadow" = ''
         root:NP:::::::
         daemon:NP:::::::
@@ -1621,7 +1631,10 @@ in
             done < <(cat /proc/net/tcp /proc/net/tcp6 2>/dev/null)
             [ -z "$inuse" ] && { port=$cand; break; }
           done
-          : "''${port:=2222}"
+          if [ -z "$port" ]; then
+            echo "illumos VM: could not find a free port in 20000-39999 after 50 tries; refusing to fall back to a fixed port (that reintroduces the very collision this randomisation exists to avoid -- see the note above). Set \$ILLUMOS_SSH_PORT to pin one explicitly." >&2
+            exit 1
+          fi
         fi
         echo "illumos VM: guest ssh port 22 -> localhost:$port" >&2
 
@@ -1702,6 +1715,13 @@ in
         # ("Failed to map CAP 2 @ BAR4"). Nothing depends on that device: the
         # root is the ramdisk. If that ever becomes confusing, the honest fix
         # is to make vioblk work, not to go back to the CD.
+        # Printed once already, above, before virtiofsd and the boot log had a
+        # chance to say anything -- which means it has usually scrolled off by
+        # the time the console is actually usable. Say it again right here, as
+        # the last line before the boot log starts for good, so it is still on
+        # screen (or at least easy to scroll back to) once the guest is up.
+        echo "illumos VM: guest ssh port 22 -> localhost:$port" >&2
+
         exec ${pkgs.buildPackages.qemu}/bin/qemu-system-x86_64 \
           -display none -no-reboot \
           -machine accel=kvm:tcg,memory-backend=mem0 -cpu max \

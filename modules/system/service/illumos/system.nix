@@ -73,6 +73,13 @@ let
     }
     // (concatMapAttrs makeUsers service.services);
 
+  makeDataDirs =
+    _: service:
+    {
+      "${service.smf.meta.servicePrefix}" = service.smf.meta;
+    }
+    // (concatMapAttrs makeDataDirs service.services);
+
   makeGroups =
     _: service:
     {
@@ -127,9 +134,20 @@ in
 
     users.groups = concatMapAttrs makeGroups config.system.services;
 
-    # NOTE: the FreeBSD equivalent also declares a tmpfiles rule creating
-    # /var/lib/system-services. illumos has no tmpfiles implementation here and
-    # `services.tempfiles` is off in configurations/illumos-base, so each
-    # service's dataDir must be created by hand for now.
+    # Each modular service's `methodContext.workingDirectory` is its dataDir
+    # (see ./service.nix), and svc.startd chdir()s there before running the
+    # start method: a missing directory is a start failure, not a warning.
+    # The FreeBSD equivalent gets this from a tmpfiles rule; illumos has no
+    # tmpfiles implementation here and `services.tempfiles` is off in
+    # configurations/illumos-base, so make them in activation, which runs
+    # before svc.startd (see `boot.illumos.activation`).
+    system.activationScripts.illumos-service-dirs = ''
+      install -d -m 0755 /var/lib/system-services
+      ${lib.concatStringsSep "\n" (
+        lib.mapAttrsToList (
+          _: meta: "install -d -m 0755 -o ${meta.username} -g ${meta.username} ${meta.dataDir}"
+        ) (lib.concatMapAttrs makeDataDirs config.system.services)
+      )}
+    '';
   };
 }

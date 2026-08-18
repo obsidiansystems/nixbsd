@@ -1435,6 +1435,33 @@ in
 
       "etc/group" = groupText;
 
+      # The fourth account database, and the one that only bites once a
+      # service actually runs as somebody other than root.
+      #
+      # `restarter_get_method_context()` (lib/librestart/common/librestart.c)
+      # resolves the method's project, and for the default `:default` it
+      # short-circuits for uid 0 -- "Don't change project for root services"
+      # -- and otherwise calls `getdefaultproj()`. That goes through
+      # `project: files` in nsswitch.conf, which this image has had all along,
+      # to a /etc/project it did not have. `getdefaultproj()` then fails with
+      # a set errno, `get_projid()` turns that into -1, and svc.startd reports
+      #
+      #     [ start + 0.88s Name service switch is misconfigured. ]
+      #
+      # and puts the service in maintenance -- a message about the *switch*
+      # for a switch that is configured correctly and a file that is absent.
+      # This is the gate's own cmd/Adm/project verbatim; `default:3::::` is
+      # the entry that matters, being what getdefaultproj() falls back to for
+      # an account with no `project=` in user_attr and no `user.<name>` or
+      # `group.<group>` project of its own.
+      "etc/project" = ''
+        system:0::::
+        user.root:1::::
+        noproject:2::::
+        default:3::::
+        group.staff:10::::
+      '';
+
       # RBAC authorisations. Being uid 0 is *not* sufficient on illumos: a
       # privileged operation asks `chkauthattr()`, which looks the caller up by
       # name and reads that name's authorisations out of this file. With no

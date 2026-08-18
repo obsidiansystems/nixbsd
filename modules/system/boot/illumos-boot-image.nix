@@ -2401,23 +2401,33 @@ in
         # for one lookup is not worth it. The check is advisory: something else
         # could still take the port in the moment between looking and binding,
         # which is why it retries rather than trusting the first answer.
-        port=''${ILLUMOS_SSH_PORT:-}
-        if [ -z "$port" ]; then
-          for _ in $(seq 1 50); do
-            cand=$(( 20000 + RANDOM % 20000 ))
-            printf -v hex ':%04X' "$cand"
-            inuse=
-            while read -r _ local _; do
-              case "$local" in *"$hex") inuse=1; break;; esac
-            done < <(cat /proc/net/tcp /proc/net/tcp6 2>/dev/null)
-            [ -z "$inuse" ] && { port=$cand; break; }
-          done
-          if [ -z "$port" ]; then
-            echo "illumos VM: could not find a free port in 20000-39999 after 50 tries; refusing to fall back to a fixed port (that reintroduces the very collision this randomisation exists to avoid -- see the note above). Set \$ILLUMOS_SSH_PORT to pin one explicitly." >&2
+        # Two forwards now -- 22 and 80 -- so this is a function rather than
+        # the loop twice. `$ILLUMOS_SSH_PORT` / `$ILLUMOS_HTTP_PORT` pin them.
+        pick_port() {
+          local pinned=$1 what=$2 outvar=$3 cand hex inuse laddr p
+          p=$pinned
+          if [ -z "$p" ]; then
+            for _ in $(seq 1 50); do
+              cand=$(( 20000 + RANDOM % 20000 ))
+              printf -v hex ':%04X' "$cand"
+              inuse=
+              while read -r _ laddr _; do
+                case "$laddr" in *"$hex") inuse=1; break;; esac
+              done < <(cat /proc/net/tcp /proc/net/tcp6 2>/dev/null)
+              [ -z "$inuse" ] && { p=$cand; break; }
+            done
+          fi
+          if [ -z "$p" ]; then
+            echo "illumos VM: could not find a free host port for $what in 20000-39999 after 50 tries; refusing to fall back to a fixed one (that reintroduces the very collision this randomisation exists to avoid -- see the note above). Pin it explicitly instead." >&2
             exit 1
           fi
-        fi
+          printf -v "$outvar" '%s' "$p"
+        }
+
+        pick_port "''${ILLUMOS_SSH_PORT:-}" ssh port
+        pick_port "''${ILLUMOS_HTTP_PORT:-}" http httpPort
         echo "illumos VM: guest ssh port 22 -> localhost:$port" >&2
+        echo "illumos VM: guest http port 80 -> localhost:$httpPort" >&2
 
         # virtio-fs: the host's /nix/store, read-only, as a mountable device.
         #
@@ -2541,6 +2551,7 @@ in
         # the last line before the boot log starts for good, so it is still on
         # screen (or at least easy to scroll back to) once the guest is up.
         echo "illumos VM: guest ssh port 22 -> localhost:$port" >&2
+        echo "illumos VM: guest http port 80 -> localhost:$httpPort" >&2
 
         exec ${pkgs.buildPackages.qemu}/bin/qemu-system-x86_64 \
           -display none -no-reboot \
@@ -2548,7 +2559,7 @@ in
           -m ${toString memMB} \
           -object memory-backend-memfd,id=mem0,size=${toString memMB}M,share=on \
           -smp ${toString (config.virtualisation.cores or 1)} \
-          -nic user,model=virtio-net-pci,hostfwd=tcp::"$port"-:22 \
+          -nic user,model=virtio-net-pci,hostfwd=tcp::"$port"-:22,hostfwd=tcp::"$httpPort"-:80 \
           -chardev socket,id=vfs0,path="$vfsdir/vfs.sock" \
           -device vhost-user-fs-pci,chardev=vfs0,tag=store \
           ${lib.optionalString cfg.virtiofsRoot.enable "-chardev socket,id=vfsroot,path=\"$vfsdir/root.sock\" \\\n          -device vhost-user-fs-pci,chardev=vfsroot,tag=${cfg.virtiofsRoot.tag} \\\n          "}${

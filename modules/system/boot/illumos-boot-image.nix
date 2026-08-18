@@ -594,6 +594,33 @@ in
       '';
     };
 
+    rootfsHeadroom = mkOption {
+      type = types.int;
+      defaultText = lib.literalExpression "if boot.illumos.bootArchive.minimal then 64 else 0";
+      description = ''
+        Megabytes of free space to leave in the root filesystem image, on top
+        of what the staged tree needs.
+
+        The image is otherwise sized to just fit: it is a ramdisk, loaded into
+        RAM in full before `unix` is entered, so every megabyte of slack costs
+        boot time (~43ms) and guest RAM directly. That is the right trade when
+        the root is effectively read-only, which it was for as long as nothing
+        got far enough to write to it.
+
+        `bootArchive.minimal` inverts the trade, and this option exists because
+        that was found the hard way. A minimal system reaches its store over
+        virtio-fs, which is mounted READ-ONLY -- so the ramdisk is the only
+        writable filesystem the machine has, and the SMF repository, /var/run,
+        /var/adm/utmpx and every service log land on it. The archive being
+        small is exactly why proportional slack is not enough: `-virtiofs`
+        makes the archive tiny and the running system full-sized.
+        `illumos-full-virtiofs` found the floor by hitting it, seconds after
+        svc.startd began importing manifests:
+
+            NOTICE: alloc: /: file system full
+      '';
+    };
+
     rootfs = mkOption {
       type = types.enum [
         "hsfs"
@@ -654,6 +681,11 @@ in
     # actually goes in, after `init.shellProgram` and `init.preExec` have had
     # their say. Keeping the two apart is what lets the virtio-fs axis put its
     # store mount in front of userland generically -- see `interpose` above.
+    # See the option. Sized to just fit when the root is effectively read-only;
+    # given real room when the store is remote and read-only, which makes the
+    # ramdisk the only filesystem the running system can write to at all.
+    boot.illumos.rootfsHeadroom = lib.mkDefault (if cfg.bootArchive.minimal then 256 else 0);
+
     boot.illumos.init.file = lib.mkDefault "${config.system.init}/sbin/init";
     boot.illumos.bootArchive.extraFiles."sbin/init" = lib.mkDefault initChain.file;
 
@@ -1428,7 +1460,12 @@ in
                 # twentieth for cylinder-group metadata and inode blocks, plus
                 # a floor so that a tiny tree still has somewhere to put its
                 # superblock.
-                mb=$(( (kb + nfiles) / 1024 * 21 / 20 + 8 ))
+                # ...plus whatever headroom the running system needs to WRITE.
+                # Zero by default: the slack above is for making the image, not
+                # for living in it. Under `bootArchive.minimal` it is not zero,
+                # because there the ramdisk is the only writable filesystem on
+                # the machine -- see `boot.illumos.rootfsHeadroom`.
+                mb=$(( (kb + nfiles) / 1024 * 21 / 20 + 8 + ${toString cfg.rootfsHeadroom} ))
                 echo "boot archive tree is ''${kb}KB in ''${nfiles} files"
 
                 for attempt in 1 2 3 4 5; do

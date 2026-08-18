@@ -87,7 +87,6 @@ in
     '';
   };
 
-
   options.boot.illumos.bootstrap.storeMountPoint = mkOption {
     type = types.str;
     default = "/nix/store";

@@ -73,9 +73,9 @@ in
     # interposed in front of userland (the virtio-fs store mount, through
     # `init.preExec`) is still interposed here rather than being silently
     # replaced by this shim.
-    boot.illumos.init.file =
-      lib.mkIf (cfg.debugConsoleInit && consoleShim != null)
-        (lib.mkForce "${consoleShim}/sbin/init");
+    boot.illumos.init.file = lib.mkIf (cfg.debugConsoleInit && consoleShim != null) (
+      lib.mkForce "${consoleShim}/sbin/init"
+    );
 
     boot.illumos.bootArchive.files = {
 
@@ -144,11 +144,25 @@ in
       # There is deliberately no `initdefault`. On illumos the run levels are
       # vestigial -- SMF milestones replaced them -- and both entries here are
       # `sysinit`, which runs regardless of run level.
+      #
+      # The `smf` line is conditional on SMF actually being configured, and
+      # that is not tidiness. svc.startd is staged whenever the package exists,
+      # so on a configuration that does not run SMF -- `illumos-base` -- init
+      # starts a startd that has no repository to bind to. It cannot come up,
+      # it cannot reach a milestone, and it says so for ever:
+      #
+      #     Requesting System Maintenance Mode
+      #     Console login service(s) cannot run
+      #
+      # 24041 times in the 95 seconds after boot, measured, which drowns the
+      # console-login prompt that the `co` line above did successfully start.
+      # Invisible until `-virtiofs` configurations could exec anything at all;
+      # visible immediately afterwards.
       "etc/inittab" =
         lib.optionalString (consoleLogin != null) ''
           co::sysinit:/sbin/console-login
         ''
-        + ''
+        + lib.optionalString config.boot.illumos.smf.enable ''
           smf::sysinit:/lib/svc/bin/svc.startd
         '';
 

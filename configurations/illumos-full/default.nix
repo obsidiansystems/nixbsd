@@ -301,6 +301,32 @@
   # The daemon SMF exists to supervise here. Declared through the portable
   # `init.services` layer, which modules/system/boot/init/portable/illumos.nix
   # renders into an SMF manifest.
+  # Point nix clients at the daemon we just started.
+  #
+  # Without this `NIX_REMOTE` is unset, so a client opens the store DIRECTLY --
+  # and `/nix/store` here is a read-only virtio-fs mount, so the first thing
+  # that wants a lock dies:
+  #
+  #     Nix crashed. This is a bug. ...
+  #     Exception: nix::SysError: error: acquiring/releasing lock: Invalid argument
+  #
+  # virtio-fs does not support the locking operation nix uses. The daemon is
+  # the one process that can write (`/nix/var` is on the ramdisk, only
+  # `/nix/store` is the read-only share), so every client has to go through it.
+  #
+  # It also makes `nix store info` honest. Unset, it reports
+  #
+  #     Store URL: local
+  #     Trusted: 1
+  #
+  # of a store nothing can write to; with this it reports `daemon` and
+  # `Trusted: 0`, which is what is actually true.
+  #
+  # This is normally the nix module's job, but that module is off here (see the
+  # note at the top of this file) and `init.services.nix-daemon` below stands in
+  # for it, so the variable has to be set by hand.
+  environment.variables.NIX_REMOTE = "daemon";
+
   init.services.nix-daemon = {
     description = "Nix build daemon";
     startCommand = [ "${pkgs.nix}/bin/nix-daemon" ];

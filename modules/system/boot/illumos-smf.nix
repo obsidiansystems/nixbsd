@@ -337,9 +337,15 @@ in
     boot.illumos.bootArchive.files."usr/share/lib/xml/dtd/service_bundle.dtd.1" =
       builtins.readFile "${pkgs.illumos.source}/usr/src/cmd/svc/dtd/service_bundle.dtd.1";
 
-    boot.illumos.bootArchive.extraFiles."sbin/init" =
-      lib.mkIf (cfg.debugShell && pkgs.illumos ? init-shell)
-        (lib.mkForce "${pkgs.illumos.init-shell}/sbin/init");
+    # `init.shellProgram` rather than forcing `extraFiles."sbin/init"` to
+    # init-shell directly. The same wiring, with one difference that matters:
+    # /sbin/init is computed from this now (see illumos-boot-image.nix), so
+    # anything interposed in front of userland -- the virtio-fs store mount,
+    # through `init.preExec` -- lands between init-shell and the shell, instead
+    # of being discarded along with the option this used to overwrite.
+    boot.illumos.init.shellProgram = lib.mkIf (
+      cfg.debugShell && pkgs.illumos ? init-shell
+    ) pkgs.bashInteractive;
 
     # The bootstrap is reachable by name from the debug shell, not only
     # through /etc/inittab.

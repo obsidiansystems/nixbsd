@@ -118,6 +118,71 @@ static const char *const dirs[] = {
 static int failures = 0;
 
 /*
+ * Consoles to try when this program is pid 1 and nobody has given it any file
+ * descriptors -- the same list, in the same order, as init-shell.c's.
+ *
+ * The /dev names come first and will not exist yet (devfsadm is step 3, and
+ * this runs before it), so in practice it is the /devices path that answers.
+ * They are kept anyway: they are what a system that has already run devfsadm
+ * would have, and trying them costs one open(2) that fails.
+ */
+static const char *const consoles[] = {
+	"/dev/console",
+	"/dev/msglog",
+	"/devices/pci@0,0/isa@1/asy@1,3f8:a",
+	"/devices/isa/asy@1,3f8:a",
+	NULL
+};
+
+/*
+ * Make sure this program can be heard.
+ *
+ * There are two ways in, and only one of them arrives with a console. When a
+ * configuration puts a shell on the console, `init-shell` is /sbin/init: it
+ * opens the console, pushes ldterm, makes it the controlling terminal and dups
+ * it onto 0/1/2 before exec'ing this -- so there is nothing to do here, and
+ * this function must not interfere.
+ *
+ * When a configuration runs a REAL init, this program IS /sbin/init: the
+ * kernel execs it with no file descriptors open at all, so every say() below
+ * writes to a closed fd 2, fails EBADF, and the entire boot sequence runs in
+ * silence. That is not a theoretical loss. Silence at exactly this point is
+ * what made a `bootArchive.minimal` configuration that mounted nothing at all
+ * look like a kernel hang.
+ *
+ * O_NOCTTY, and no setsid()/TIOCSCTTY/I_PUSH: this process is about to become
+ * the system's real init, and session leadership and line discipline are its
+ * business, not ours. The cost is \n-only output on a raw asy(4D) stream, so a
+ * terminal that does not translate will stair-step it -- legible in a log,
+ * which is what this is for.
+ */
+static void
+ensure_console(void)
+{
+	int i, fd;
+
+	if (fcntl(2, F_GETFD) >= 0)
+		return;
+
+	for (i = 0; consoles[i] != NULL; i++) {
+		if ((fd = open(consoles[i], O_RDWR | O_NOCTTY)) < 0)
+			continue;
+
+		(void) dup2(fd, 0);
+		(void) dup2(fd, 1);
+		(void) dup2(fd, 2);
+		if (fd > 2)
+			(void) close(fd);
+		return;
+	}
+
+	/*
+	 * Nothing to say anything on. Carry on regardless: the steps below are
+	 * what makes the machine work, and none of them needs a console.
+	 */
+}
+
+/*
  * Everything this program says goes to stderr, unbuffered by fprintf's usual
  * line discipline on a tty but flushed anyway: the console here is a bare
  * asy(4D) stream, and a boot that panics or hangs with a message still sitting
@@ -402,6 +467,8 @@ main(int argc, char **argv)
 {
 	extern char **environ;
 
+	ensure_console();
+
 	say("bootstrap: starting\n");
 
 	/* 1. The read-write root. Everything below needs it. */
@@ -534,29 +601,47 @@ main(int argc, char **argv)
 	 * forking keeps init's child count at one and keeps its respawn logic
 	 * (init-shell.c) meaningful: when the shell exits, init sees it.
 	 *
-	 * argv[0] gets a leading '-'. That is what makes bash a LOGIN shell,
-	 * which is the convention a console shell is expected to follow. It no
-	 * longer has any functional weight here -- the point of this program is
-	 * that /etc/profile is gone -- but a shell that thinks it is a login
-	 * shell is what anyone typing at this console will expect.
+	 * WHAT we hand over to is not this program's business, and neither is
+	 * how to call it. Both come from -D defines, because the two cases want
+	 * opposite things and neither can be inferred here:
+	 *
+	 *   * bash, on a configuration that wants a shell as pid 1. argv[0] is
+	 *     "-bash" -- the leading '-' is what makes it a LOGIN shell, the
+	 *     convention a console shell is expected to follow -- and it gets
+	 *     `-i`. NEXT_LOGIN is defined.
+	 *
+	 *   * the system's REAL /sbin/init, on a configuration where this
+	 *     program is a pre-init shim that mounts the store and gets out of
+	 *     the way. argv[0] is "init", with no dash and no `-i`: to init(8)
+	 *     `-i` is not "interactive", it is a RUN LEVEL. NEXT_LOGIN is not
+	 *     defined.
+	 *
+	 * Either way this exec keeps the process: whatever pid this program was
+	 * given, its successor inherits. That is what lets a real init stay pid
+	 * 1, and what keeps init-shell.c's respawn logic meaningful in the shell
+	 * case -- when the shell exits, its init sees it.
 	 *
 	 * Any arguments given to bootstrap are passed through, so a
-	 * configuration can say `bootstrap -c 'something'` without a rebuild.
+	 * configuration can say `bootstrap -c 'something'` without a rebuild,
+	 * and so the boot arguments the kernel passes /sbin/init reach init.
 	 */
 	{
 		char **av;
-		int i;
+		int i, n = 0;
 
-		if ((av = calloc((size_t)argc + 2, sizeof (char *))) == NULL) {
+		if ((av = calloc((size_t)argc + 3, sizeof (char *))) == NULL) {
 			say("bootstrap: out of memory handing over to %s\n",
 			    NEXT_PROG);
 			return (1);
 		}
 
-		av[0] = "-" NEXT_ARGV0;
-		av[1] = "-i";
+		av[n++] = NEXT_ARGV0;
+#ifdef	NEXT_LOGIN
+		av[n++] = "-i";
+#endif
 		for (i = 1; i < argc; i++)
-			av[i + 1] = argv[i];
+			av[n++] = argv[i];
+		av[n] = NULL;
 
 		say("bootstrap: exec %s\n", NEXT_PROG);
 		(void) execve(NEXT_PROG, av, environ);

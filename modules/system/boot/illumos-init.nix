@@ -67,7 +67,13 @@ in
     # anyone on an older nixpkgs with an "attribute missing" error that reads
     # like a real bug rather than work in progress. Same reason `system.init`
     # is spelled `pkgs.illumos.init or pkgs.illumos.init-shell`.
-    boot.illumos.bootArchive.extraFiles."sbin/init" =
+    #
+    # `boot.illumos.init.file` rather than `bootArchive.extraFiles."sbin/init"`
+    # directly: the latter is computed from the former now, so that whatever is
+    # interposed in front of userland (the virtio-fs store mount, through
+    # `init.preExec`) is still interposed here rather than being silently
+    # replaced by this shim.
+    boot.illumos.init.file =
       lib.mkIf (cfg.debugConsoleInit && consoleShim != null)
         (lib.mkForce "${consoleShim}/sbin/init");
 

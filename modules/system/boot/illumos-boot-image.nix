@@ -131,12 +131,155 @@ let
       cfg.bootArchive.storePaths;
   closure = pkgs.buildPackages.closureInfo { inherit rootPaths; };
 
+  # ------------------------------------------------------------------
+  # /sbin/init, and what may be interposed in front of userland.
+  #
+  # Three inputs (`init.file`, `init.shellProgram`, `init.preExec`) and one
+  # output: the file staged as /sbin/init, plus the store paths that staging it
+  # requires. It is written here, once, rather than in each configuration
+  # because interposition and configuration-choice are different questions:
+  # `modules/illumos/virtiofs-store.nix` has to put the store mount in front of
+  # userland WITHOUT knowing whether userland is bash, init(8) or init(8) plus
+  # SMF, and each of those configurations has to keep choosing its own init
+  # without knowing whether anything is being interposed.
+  # ------------------------------------------------------------------
+
+  # Apply the hook, if there is one, to a handover spec. Returns a spec of the
+  # same shape -- so callers below need not care whether anything happened --
+  # plus `root`, the package that must be staged when it did.
+  interpose =
+    next:
+    if cfg.init.preExec == null then
+      next // { root = null; }
+    else
+      let
+        prog = cfg.init.preExec next;
+        exe = lib.getExe prog;
+      in
+      {
+        path = exe;
+        argv0 = baseNameOf exe;
+        login = false;
+        root = prog;
+      };
+
+  initChain =
+    if cfg.init.shellProgram != null then
+      let
+        exe = lib.getExe cfg.init.shellProgram;
+
+        # argv[0] with a leading '-'; the console program is expected to be a
+        # login shell. If something is interposed, IT is exec'd with these and
+        # passes them on -- see the handover in bootstrap.c.
+        next = interpose {
+          path = exe;
+          argv0 = "-" + baseNameOf exe;
+          login = true;
+        };
+
+        # init-shell.nix does not take a program, it bakes in a PATH:
+        #
+        #     -DPROG='"${bashInteractive}/bin/bash"'
+        #
+        # so handing it any package that is not bash compiles in a
+        # <that>/bin/bash which does not exist -- and init reports that as the
+        # single unhelpful line "init: exec failed" before powering the machine
+        # off. (Asked, answered, and it cost a boot; do not rediscover it.)
+        # Rather than change the nixpkgs package -- init-shell is
+        # general-purpose, and "what to exec" is the configuration's business
+        # -- give it a directory whose `bin/bash` is the program we want.
+        progDir = pkgs.runCommandLocal "illumos-init-prog" { } ''
+          mkdir -p $out/bin
+          ln -s ${next.path} $out/bin/bash
+        '';
+      in
+      {
+        file = "${(pkgs.illumos.init-shell).override { bashInteractive = progDir; }}/sbin/init";
+
+        # A *root*, not merely something referenced: /sbin/init is staged with
+        # `extraFiles`, which COPIES a file, and a copied file's references are
+        # not followed. Without this the archive holds an init whose
+        # compiled-in program is not in the image -- "init: exec failed" again.
+        roots = [ progDir ];
+      }
+    else
+      let
+        # Real init(8). argv[0] is "init", with no dash and no `-i`: to init
+        # `-i` is a run level, not "interactive".
+        next = interpose {
+          path = cfg.init.file;
+          argv0 = "init";
+          login = false;
+        };
+      in
+      {
+        file = next.path;
+        # Same copied-file argument. Nothing is needed when nothing was
+        # interposed: `system.init` is already a root of both store path lists.
+        roots = lib.optional (next.root != null) next.root;
+      };
+
   # Guest RAM, in MB. See the note above `system.build.vm`.
-  memMB =
-    config.virtualisation.memorySize or (if cfg.bootArchive.minimal then 2048 else 6144);
+  memMB = config.virtualisation.memorySize or (if cfg.bootArchive.minimal then 2048 else 6144);
 in
 {
   options.boot.illumos = {
+    init.file = mkOption {
+      type = types.str;
+      example = lib.literalExpression ''"''${pkgs.illumos.init}/sbin/init"'';
+      description = ''
+        The program the kernel should exec as /sbin/init, BEFORE any
+        interposition by `boot.illumos.init.preExec`.
+
+        Defaults to `system.init`, which is the real init(8) wherever it is
+        packaged. Override it to boot something else entirely -- the
+        `debugConsoleInit` shim in illumos-init.nix does exactly that.
+
+        Ignored when `init.shellProgram` is non-null: a configuration that
+        wants a shell as pid 1 has already answered this question.
+      '';
+    };
+
+    init.shellProgram = mkOption {
+      type = types.nullOr types.package;
+      default = null;
+      example = lib.literalExpression "pkgs.bashInteractive";
+      description = ''
+        Run `illumos.init-shell` as /sbin/init, with this package's
+        `mainProgram` as the program it execs, instead of running a real
+        init(8). This is what "a shell as pid 1" means here.
+
+        A package rather than a path because init-shell does not take a
+        program, it BAKES ONE IN, as
+        `-DPROG='"''${bashInteractive}/bin/bash"'`; this module builds the
+        directory that override needs.
+      '';
+    };
+
+    init.preExec = mkOption {
+      type = types.nullOr (types.functionTo types.package);
+      default = null;
+      internal = true;
+      description = ''
+        A hook to interpose a program in front of userland. Given the handover
+        spec of what would otherwise have run -- `{ path, argv0, login }` --
+        it returns a package whose `mainProgram` runs first and then execs
+        that.
+
+        This exists so that "the store is mounted over virtio-fs" can be a
+        module (modules/illumos/bootstrap.nix) rather than a hand-edit per
+        configuration. The interposition point differs by configuration and
+        the hook hides the difference: with a shell as pid 1 the program goes
+        between init-shell and the shell, so init-shell still supplies the
+        console and the respawn; with a real init it becomes /sbin/init itself
+        and execs the real one, which therefore stays pid 1.
+
+        A function, not a package, because the program has to be BUILT knowing
+        what it hands over to -- the path is a -D define, and hence a nix
+        reference.
+      '';
+    };
+
     bootArchive.extraFiles = mkOption {
       type = types.attrsOf types.path;
       default = { };
@@ -506,8 +649,13 @@ in
     # (uts/common/os/main.c:140, zone_initname), and the boot archive is the
     # root filesystem, so the binary has to be in here. See the note on
     # `system.init` in system/activation/top-level.nix.
-    boot.illumos.bootArchive.extraFiles."sbin/init" =
-      lib.mkDefault "${config.system.init}/sbin/init";
+    #
+    # `init.file` is what the configuration ASKED for; `initChain.file` is what
+    # actually goes in, after `init.shellProgram` and `init.preExec` have had
+    # their say. Keeping the two apart is what lets the virtio-fs axis put its
+    # store mount in front of userland generically -- see `interpose` above.
+    boot.illumos.init.file = lib.mkDefault "${config.system.init}/sbin/init";
+    boot.illumos.bootArchive.extraFiles."sbin/init" = lib.mkDefault initChain.file;
 
     # The whole system closure, so that the shell init execs -- an ordinary
     # dynamically linked illumos program -- can actually run, along with
@@ -522,6 +670,11 @@ in
       # below, but it also has to be in the closure or the store path the
       # symlink points at is not in the image at all.
       ++ lib.optional (pkgs.illumos.nss-files or null != null) pkgs.illumos.nss-files
+
+      # Whatever `initChain` had to build to make /sbin/init what it is. Empty
+      # unless something is interposed or a shell is pid 1; see above for why
+      # it cannot ride along as a reference.
+      ++ initChain.roots
     );
 
     # The `minimal` root set: what has to be in the archive because it is what
@@ -532,42 +685,45 @@ in
     # packaged one of these yet -- a missing attribute here would be an
     # evaluation error for every illumos configuration, `minimal` or not.
     boot.illumos.bootArchive.minimalStorePaths = lib.mkDefault (
-      lib.filter (p: p != null) [
-        # init itself. Freestanding, so it is not reachable from anything
-        # else's references -- exactly as in `storePaths` above.
-        config.system.init
+      lib.filter (p: p != null) (
+        initChain.roots
+        ++ [
+          # init itself. Freestanding, so it is not reachable from anything
+          # else's references -- exactly as in `storePaths` above.
+          config.system.init
 
-        # ld.so.1 and libc.so.1. /lib/amd64 is a farm of symlinks *into* the
-        # store (see the archive builder), so the store path has to be here or
-        # every one of those links dangles and nothing dynamically linked runs
-        # at all -- which is everything, including the mount helper.
-        pkgs.illumos.libc
+          # ld.so.1 and libc.so.1. /lib/amd64 is a farm of symlinks *into* the
+          # store (see the archive builder), so the store path has to be here or
+          # every one of those links dangles and nothing dynamically linked runs
+          # at all -- which is everything, including the mount helper.
+          pkgs.illumos.libc
 
-        # The name service switch backends, dlopen()'d by bare name. Same
-        # argument: /lib/amd64/nss_files.so.1 is a symlink into the store.
-        (pkgs.illumos.nss-files or null)
+          # The name service switch backends, dlopen()'d by bare name. Same
+          # argument: /lib/amd64/nss_files.so.1 is a symlink into the store.
+          (pkgs.illumos.nss-files or null)
 
-        # mount(2) with an explicit fstype: the virtio-fs mount helper. There
-        # is no /usr/lib/fs/virtiofs/mount to dispatch to -- virtio-fs has no
-        # helper at all -- so this *is* the mount, and without it the archive
-        # is minimal for nothing.
-        (pkgs.illumos.mountvfs or null)
+          # mount(2) with an explicit fstype: the virtio-fs mount helper. There
+          # is no /usr/lib/fs/virtiofs/mount to dispatch to -- virtio-fs has no
+          # helper at all -- so this *is* the mount, and without it the archive
+          # is minimal for nothing.
+          (pkgs.illumos.mountvfs or null)
 
-        # The three that have to run before the mount can be attempted, in
-        # order. See the sequence in the debug configuration's /etc/profile:
-        # the root is mounted read-only by ufs_mountroot(), sdev's backing
-        # store is the root filesystem, so until mount-ufs has remounted it
-        # read-write devfsadm cannot create a single node -- and with no nodes
-        # there is no device to mount from.
-        (pkgs.illumos.mount-ufs or null)
-        (pkgs.illumos.devfsadm or null)
+          # The three that have to run before the mount can be attempted, in
+          # order. See the sequence in the debug configuration's /etc/profile:
+          # the root is mounted read-only by ufs_mountroot(), sdev's backing
+          # store is the root filesystem, so until mount-ufs has remounted it
+          # read-write devfsadm cannot create a single node -- and with no nodes
+          # there is no device to mount from.
+          (pkgs.illumos.mount-ufs or null)
+          (pkgs.illumos.devfsadm or null)
 
-        # Socket-to-transport mappings. Not needed by virtio-fs itself, but
-        # without them socket(AF_INET, ...) fails at creation, which takes the
-        # network with it -- and the network is the only way to get at a
-        # machine whose console has gone quiet after consconfig().
-        (pkgs.illumos.soconfig or null)
-      ]
+          # Socket-to-transport mappings. Not needed by virtio-fs itself, but
+          # without them socket(AF_INET, ...) fails at creation, which takes the
+          # network with it -- and the network is the only way to get at a
+          # machine whose console has gone quiet after consconfig().
+          (pkgs.illumos.soconfig or null)
+        ]
+      )
     );
 
     # "Break everything, but quickly" is the accepted trade -- but not so
@@ -854,11 +1010,13 @@ in
     system.build.bootArchive =
       pkgs.runCommand "illumos-boot-archive"
         {
-          nativeBuildInputs = with pkgs.buildPackages; [
-            libisoburn
-            gawk
-          ]
-          ++ lib.optional (cfg.rootfs == "ufs") pkgs.illumos.mkfs-ufs;
+          nativeBuildInputs =
+            with pkgs.buildPackages;
+            [
+              libisoburn
+              gawk
+            ]
+            ++ lib.optional (cfg.rootfs == "ufs") pkgs.illumos.mkfs-ufs;
 
           # `uts-base.buildtree` is the whole patched kernel source tree, a
           # 320MB output that exists so `kmod.nix` can build one module at a
@@ -1012,7 +1170,9 @@ in
           : >ba/etc/mnttab
           echo '#' >ba/etc/path_to_inst
 
-          mkdir -p ${lib.concatMapStringsSep " " (d: "ba/${lib.escapeShellArg d}") cfg.bootArchive.mountPoints}
+          mkdir -p ${
+            lib.concatMapStringsSep " " (d: "ba/${lib.escapeShellArg d}") cfg.bootArchive.mountPoints
+          }
           : >ba/etc/dfs/sharetab
 
           ${lib.concatStringsSep "\n" (

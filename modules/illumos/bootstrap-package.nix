@@ -6,12 +6,31 @@
   devfsadm,
   soconfig,
 
-  # The program to hand the console to when the sequence is done. A package;
-  # `lib.getExe` picks the binary. Null means "park after the last step",
-  # which is what an unattended configuration wants -- and, more to the point,
-  # it is what makes the shell OPTIONAL: pass null and no shell appears in
-  # this derivation's references, so none appears in the boot archive either.
-  shell ? null,
+  # What to exec when the sequence is done, as
+  #
+  #   { path = "/nix/store/.../bin/bash"; argv0 = "-bash"; login = true; }
+  #
+  # Null means "park after the last step", which is what an unattended
+  # configuration wants -- and, more to the point, it is what makes the
+  # handover OPTIONAL: pass null and nothing downstream appears in this
+  # derivation's references, so none of it appears in the boot archive either.
+  #
+  # This used to be `shell ? <package>`, and generalising it is the point of
+  # this file's move out of `configurations/illumos-debug`. There, the thing
+  # after bootstrap is bash, because that configuration wants a shell as pid 1.
+  # In `illumos-base` and `illumos-full` it is the system's REAL /sbin/init,
+  # because bootstrap is a pre-init shim there. A package plus `lib.getExe`
+  # cannot express the second case -- real init lives at `$out/sbin/init`, not
+  # at `$out/bin/<mainProgram>` -- and the argument vector cannot be inferred
+  # at all:
+  #
+  #   * `argv0` carries the leading '-' or not. A console shell is expected to
+  #     be a login shell; init(8) called "-init" is not something anyone has
+  #     ever tested.
+  #   * `login` adds `-i`, which to bash means "be interactive" and to init(8)
+  #     means "go to run level i". Passing it to init would be a real bug, not
+  #     merely untidy.
+  next ? null,
 
   # Optional network bring-up, as
   #
@@ -41,9 +60,18 @@
 # directories to create, that devfsadm runs before soconfig, that the virtio-fs
 # tag is `store` and that it mounts on /mnt/store. Those are configuration
 # decisions, and they are exactly the decisions the /etc/profile in
-# ./default.nix used to encode -- so its replacement belongs where that script
-# lived, beside the configuration it serves, and nixpkgs' illumos set stays
+# `configurations/illumos-debug` used to encode -- so its replacement belongs
+# beside the configurations it serves, and nixpkgs' illumos set stays
 # general-purpose tools.
+#
+# It sits in `modules/illumos` rather than in one configuration's directory
+# because the sequence is not one configuration's business. It was, for as long
+# as `illumos-debug` was the only thing that mounted a virtio-fs store; the
+# moment `modules/illumos/virtiofs-store.nix` made "where does the store come
+# from" an axis that any configuration can take, a mount that only one
+# configuration performed became a bug -- `illumos-base-virtiofs` shrank its
+# boot archive on the promise of a mount and then booted into nothing at all.
+# See ./bootstrap.nix, the module that installs this.
 #
 # Built with `pkgs.illumos.callPackage`, so `mkDerivation` and `headers` are
 # the illumos set's own -- the same cross compiler and the same gate headers
@@ -104,19 +132,24 @@ mkDerivation {
         -DDEVFSADM='"${lib.getExe devfsadm}"' \
         -DSOCONFIG='"${lib.getExe soconfig}"' \
         -DSOCONFIG_DIR='"${soconfig}/etc/sock2path.d"' \
-        ${lib.optionalString (shell != null) ''
-          -DNEXT_PROG='"${lib.getExe shell}"' \
-          -DNEXT_ARGV0='"${baseNameOf (lib.getExe shell)}"' \
-        ''} \
-        ${lib.optionalString (network != null) ''
-          -DDLMGMTD='"${lib.getExe network.dlmgmtd}"' \
-          -DDLMGMTD_SEED='"${network.dlmgmtd}/share/dlmgmtd/datalink.conf"' \
-          -DIFCONFIG='"${lib.getExe network.ifconfig}"' \
-          -DSETADDR='"${lib.getExe network.setaddr}"' \
-          -DIFNAME='"${network.interface}"' \
-          -DIFADDR='"${network.address}"' \
-          -DIFMASK='"${network.netmask}"' \
-        ''} \
+        ${
+          lib.optionalString (next != null) ''
+            -DNEXT_PROG='"${next.path}"' \
+            -DNEXT_ARGV0='"${next.argv0}"' \
+            ${lib.optionalString (next.login or false) "-DNEXT_LOGIN=1"} \
+          ''
+        } \
+        ${
+          lib.optionalString (network != null) ''
+            -DDLMGMTD='"${lib.getExe network.dlmgmtd}"' \
+            -DDLMGMTD_SEED='"${network.dlmgmtd}/share/dlmgmtd/datalink.conf"' \
+            -DIFCONFIG='"${lib.getExe network.ifconfig}"' \
+            -DSETADDR='"${lib.getExe network.setaddr}"' \
+            -DIFNAME='"${network.interface}"' \
+            -DIFADDR='"${network.address}"' \
+            -DIFMASK='"${network.netmask}"' \
+          ''
+        } \
         ${./bootstrap.c}
     runHook postBuild
   '';

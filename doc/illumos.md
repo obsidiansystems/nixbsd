@@ -19,6 +19,8 @@ It boots to a login prompt on the serial console in about 10 seconds.
 The two forwarded ports are printed on stderr twice:
 once when they are chosen, and once just before qemu starts,
 because the first pair scrolls away behind the boot log.
+(But my scrollback still gets messed up once the VM comes up, so I can't see them.
+You might face the same issue.)
 
 ```
 illumos VM: guest ssh port 22 -> localhost:31337
@@ -27,6 +29,18 @@ illumos VM: guest http port 80 -> localhost:24242
 
 The ports are random so that several VMs can run at once.
 Pin them with `ILLUMOS_SSH_PORT` and `ILLUMOS_HTTP_PORT`.
+The works around the scrollback issue.
+
+The VM console should do something like
+
+```
++ /nix/store/lw64c5gkbwz816vw2g1nlja5lvrccqz1-svccfg-x86_64-unknown-solaris2.11-2.11/bin/svccfg import /lib/svc/manifest/milestone/multi-user.xml /lib/svc/manifest/milestone/network.xml /lib/svc/manifest/milestone/single-user.xml /lib/svc/manifest/network/datalink-management.xml /lib/svc/manifest/network/ip-interface-management.xml /lib/svc/manifest/network/physical.xml /lib/svc/manifest/site/hello.xml /lib/svc/manifest/site/nginx.xml /lib/svc/manifest/site/nix-daemon.xml /lib/svc/manifest/site/sshd.xml /lib/svc/manifest/site/suid-sgid-wrappers.xml /lib/svc/manifest/site/tempfiles.xml /lib/svc/manifest/system/console-login.xml /lib/svc/manifest/system/identity.xml /lib/svc/manifest/system/filesystem/local.xml /lib/svc/manifest/system/filesystem/minimal.xml
++ exec /lib/svc/bin/svc.startd
+
+```
+
+and then appear to hang.
+That's normal, you connect to the machine via SSH.
 
 ## Log in
 
@@ -63,6 +77,7 @@ Server: nginx
 ## Look around
 
 ```sh
+nixos-version           # 26.11.<date>.<hash> (Zokor)
 svcs -a                 # 17 services online, nothing in maintenance
 svcs -xv                # explains anything that is not
 ipadm show-addr         # vioif0 has 10.0.2.15/24

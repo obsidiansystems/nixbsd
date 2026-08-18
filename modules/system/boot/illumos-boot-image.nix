@@ -1016,6 +1016,51 @@ in
     system.activationScripts.cap_mkdb = lib.mkForce "";
     system.activationScripts.users = lib.mkForce "";
 
+    # Core dumps: off by default, because there is nowhere safe to put them.
+    #
+    # illumos' default per-process policy writes a full core named `core` into
+    # the crashing process's current directory, which for an SMF service is
+    # `/`. The root filesystem here is a ramdisk of a few hundred megabytes and
+    # is the ONLY writable filesystem the machine has, so a daemon that crashes
+    # in a loop fills it:
+    #
+    #     NOTICE: alloc: /: file system full
+    #
+    # and sshd then starts dying mid-session. Not hypothetical --
+    # `svc:/site/nix-daemon:default` was dumping 58 MB a time into a 364 MB
+    # root, and it cost several dropped ssh sessions to identify, because the
+    # symptom (ssh drops) looks nothing like the cause (an unrelated daemon
+    # crashing). There is nowhere to redirect to: /var and /tmp are the same
+    # ramdisk, and the only other filesystem is the read-only store.
+    #
+    # `-u` and a config file, NOT `-d process`, and that is not a style choice.
+    # Modern coreadm keeps its policy in SMF -- `config_params` on
+    # `svc:/system/coreadm:default` -- so `coreadm -d process` writes SMF
+    # properties and refuses outright when that service is absent:
+    #
+    #     coreadm: coreadm service not online
+    #
+    # which is what happens here, since we do not ship that service. `-u` is
+    # the legacy path: `do_legacy()` reads /etc/coreadm.conf and calls
+    # `write_kernel()` directly (cmd/coreadm/coreadm.c:678), with no SMF
+    # involvement at all. Verified in a booted guest -- `-d process` fails as
+    # above, `-u` reports "per-process core dumps: disabled".
+    #
+    # Turn it back on for debugging with `coreadm -e process`, which works
+    # once svc.startd is up, or by editing this file.
+    environment.etc."coreadm.conf".text = ''
+      COREADM_PROC_ENABLED=no
+      COREADM_GLOB_ENABLED=no
+      COREADM_PROC_SETID_ENABLED=no
+      COREADM_GLOB_SETID_ENABLED=no
+      COREADM_GLOB_LOG_ENABLED=no
+    '';
+
+    system.activationScripts.illumos-coredumps = lib.stringAfter [ "etc" ] ''
+      ${pkgs.illumos.coreadm}/bin/coreadm -u
+    '';
+
+
     # ------------------------------------------------------------------
     # The accounts a stock illumos expects, with the uids and gids a stock
     # illumos gives them. These used to be text inside the /etc/passwd

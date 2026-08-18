@@ -247,10 +247,20 @@
   ];
 
   # Root is the only account on this system, so refusing root logins refuses
-  # all of them. `prohibit-password` rather than `yes`: /etc/shadow carries
-  # `NP` for root, so there is no password to offer in any case, and this says
-  # so explicitly rather than relying on it.
-  services.openssh.settings.PermitRootLogin = "prohibit-password";
+  # all of them.
+  #
+  # This is a scratch VM, reachable only through a qemu user-mode forward bound
+  # to 127.0.0.1, and the point of it is to be trivially enterable while
+  # debugging the OS underneath. `/etc/shadow` gives root an empty password
+  # field, so with these three settings `ssh root@127.0.0.1` gets a shell with
+  # nothing to type and no key to manage.
+  #
+  # None of this belongs on a machine with a real network path.
+  services.openssh.settings = {
+    PermitRootLogin = "yes";
+    PasswordAuthentication = true;
+    PermitEmptyPasswords = true;
+  };
 
   services.nginx = {
     enable = true;

@@ -6,6 +6,8 @@ single non-resizable terminal with no scrollback.
 
 ## The short version
 
+OLD OF DATE just ssh root no password!
+
 ```sh
 # 1. put your public key in the config (see "Authorising your key" below)
 # 2. run the VM, pinning the port so you know where to connect

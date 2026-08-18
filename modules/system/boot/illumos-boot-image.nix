@@ -999,7 +999,23 @@ in
       #
       # `NP` ("no password") is illumos' marker for an account that cannot be
       # logged into with a password but is not locked. The daemon accounts
-      # below already carry it; it leaves key authentication alone.
+      # below carry it; it leaves key authentication alone.
+      #
+      # root's field is EMPTY, which is different: empty means "no password
+      # REQUIRED", so `ssh root@127.0.0.1` gets a shell with nothing typed and
+      # no key to manage. Paired with `PermitEmptyPasswords` in
+      # `configurations/illumos-full`. This is a scratch VM reachable only
+      # through a qemu user-mode forward on 127.0.0.1, and being trivially
+      # enterable is the point while the OS underneath is the thing being
+      # debugged. It must not follow this image anywhere with a real network
+      # path.
+      #
+      # Empty rather than a hash for a practical reason as well: illumos'
+      # `crypt(3C)` resolves a `$5$`/`$6$` prefix through
+      # /etc/security/crypt.conf and the matching
+      # /usr/lib/security/crypt_sha256.so.1, and this image ships neither. That
+      # leaves only the built-in traditional DES algorithm, which modern
+      # libxcrypt will not even generate any more.
       #
       # This literal string, not `users.users.*` / `update-users-groups.pl`,
       # is the entire source of truth for illumos' `/etc/shadow`. That NixOS
@@ -1011,7 +1027,7 @@ in
       # which shows `NP` for root regardless. `illumos-base` used to set it to
       # "toor"; that line was removed rather than left to lie.
       "etc/shadow" = ''
-        root:NP:::::::
+        root::::::::
         daemon:NP:::::::
         bin:NP:::::::
         sys:NP:::::::

@@ -103,3 +103,36 @@ Each of these has actually been the cause:
 Deliberately minimal, and it surprises people debugging: there is no `ps`,
 `netstat`, `telnet`, `mount(8)`, `modinfo` or `strings`. `mountvfs` stands in
 for `mount`. bash's `/dev/tcp` and `/proc` are often the only tools to hand.
+
+## Device opens that fail as a daemon and work as root
+
+If something opens a device node, works when you test it by hand, and fails
+with `EACCES` once it runs as its own user — while `ls -l` shows the node
+world-readable and world-writable — it is almost certainly the device
+**policy**, not the permissions.
+
+illumos checks two independent things on a device open. The mode bits are the
+familiar one. The other is a privilege set from `/etc/security/device_policy`,
+and until that file is loaded the kernel keeps its compiled-in default of *all
+privileges required to open any device* (`uts/common/os/devpolicy.c:148`). Root
+has all privileges, so root never notices.
+
+Both that file and `/etc/minor_perm` are loaded by **`devfsadm -P`**, which is
+the only caller of `load_dev_acl()`. A bare `devfsadm` loads neither — so
+re-running `devfsadm` to test a theory proves nothing, and the data files look
+correct while having no effect. The bootstrap runs the `-P` pass before the
+populating run (`minor_perm` is consulted as nodes are created, so loading it
+afterwards is too late for everything already made).
+
+To check it is working: `grep 'devfsadm -P' <boot log>` should show
+`bootstrap: devfsadm -P ok`, and a node with a `minor_perm` entry should show
+that entry's mode — e.g. `ls -lL /dev/poll` → `crw-rw-rw- root sys`.
+
+nginx is the worked example. It uses `/dev/poll` and nothing else — `use poll;`
+and `use select;` are both rejected as `invalid event type`, so there is no
+config workaround — and its worker setuids to `nginx`. The failure mode is
+nasty: the worker dies, the master survives holding the listen socket, so SMF
+reports `online`, `svcs -p` shows a process, port 80 accepts connections, and
+every request returns nothing at all. The reason appears only in nginx's own
+`error_log stderr`, which the service log does not capture; run it in the
+foreground to see it. A healthy `svcs -p nginx` shows **two** processes.

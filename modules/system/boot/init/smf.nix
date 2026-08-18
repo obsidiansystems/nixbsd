@@ -65,23 +65,50 @@ let
   #
   #     svccfg: Could not delete svc:/TEMP/<service> (repository connection broken).
   #
-  # which is ECONNABORTED from the door call -- configd is gone, and gone
-  # silently, without the message its own error paths would have printed. The
-  # repository is left incomplete and svc.startd then puts everything into
-  # maintenance. Bisected by narrowing the one manifest that had two FMRIs in a
-  # single block (sshd) down to one, after which all nine manifests import
-  # cleanly.
+  # which is ECONNABORTED from the door call: configd took SIGSEGV, so its own
+  # error paths never ran. The repository is left incomplete and svc.startd
+  # then puts everything into maintenance.
   #
-  # So emit one block per FMRI. For the "all" groupings that is the same thing:
-  # requiring A and B in one block is requiring A in one block and B in another.
+  # The cause, read out of configd's core -- it writes one as
+  # `core.svc.configd.<time>.<pid>` in its own cwd, via
+  # `core_set_process_path` at cmd/svc/configd/configd.c:659, which as root is
+  # `/`. The faulting thread is
+  #
+  #     client_switcher -> tx_commit -> rc_tx_commit -> object_tx_commit
+  #       -> tx_process_cmds -> backend_tx_run_update
+  #       -> sqlite_exec_vprintf -> sqlite_vmprintf -> base_vprintf -> vxprintf
+  #
+  # dying on the `'%q'` argument of the per-value INSERT into `value_tbl`,
+  # with a pointer exactly 2^32 below the buffer it should have named. That
+  # pointer is built one line above the INSERT, at
+  # cmd/svc/configd/object.c:324:
+  #
+  #     v = (uint32_t *)((caddr_t)str + TX_SIZE(*v));
+  #
+  # `TX_SIZE(x)` is `P2ROUNDUP((x), sizeof (uint32_t))`
+  # (common/svc/repcache_protocol.h:765), and `P2ROUNDUP(x, align)` is
+  # `(-(-(x) & -(align)))` (uts/common/sys/sysmacros.h:268). With `x` a
+  # `uint32_t` and `align` a `size_t`, `-(x)` is evaluated in 32 bits and then
+  # *zero*-extended to 64 before the mask, so the closing negation lands in
+  # the top half: `TX_SIZE((uint32_t)27)` is 0xffffffff0000001c, not 28. Every
+  # other TX_SIZE call site assigns the result back to a 32-bit variable and
+  # so truncates the damage away; this one feeds it straight into pointer
+  # arithmetic. It is reached only from the second iteration of the value loop
+  # onwards, which is exactly why one `<service_fmri>` is fine and two are
+  # fatal.
+  #
+  # It is 64-bit-only -- with a 32-bit `size_t` both halves agree -- which is
+  # why upstream, where cmd/svc/configd is still built 32-bit, has never hit
+  # it. The fix (cast the operand to `size_t`) belongs in illumos-gate, not
+  # here.
+  #
+  # Until then, emit one block per FMRI. For the "all" groupings that is the
+  # same thing: requiring A and B in one block is requiring A in one block and
+  # B in another.
   #
   # It is *not* the same for `require_any` ("any one of these") or `exclude_all`,
   # so those are left alone and will still hit the bug -- better than silently
   # turning "any" into "all". Nothing generates them today.
-  #
-  # TODO drop this once configd is fixed. The real bug is configd's, and any
-  # hand-written illumos manifest hits it too, where multi-FMRI dependencies are
-  # entirely normal.
   splittableGrouping = g: g == "require_all" || g == "optional_all";
 
   fmriNodes = fmris: map (f: leaf "service_fmri" { value = f; }) fmris;

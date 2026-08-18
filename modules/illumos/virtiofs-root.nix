@@ -34,11 +34,11 @@
 # repository, /var/run, /var/adm/utmpx, /var/svc/log and sshd's host keys all
 # need somewhere to go.
 #
-# The answer is tmpfs on /var and /tmp, mounted by `bootstrap` before it hands
-# over. The alternative considered and rejected was the boot archive ramdisk,
-# which is still loaded and still a perfectly good UFS filesystem: it is a
-# FIXED size chosen at build time, and `boot.illumos.rootfsHeadroom` exists
-# because getting that size wrong is how `illumos-full-virtiofs` met
+# The answer is tmpfs on /var, /tmp and /run, mounted by `bootstrap` before it
+# hands over. The alternative considered and rejected was the boot archive
+# ramdisk, which is still loaded and still a perfectly good UFS filesystem: it
+# is a FIXED size chosen at build time, and `boot.illumos.rootfsHeadroom`
+# exists because getting that size wrong is how `illumos-full-virtiofs` met
 # `NOTICE: alloc: /: file system full` seconds into svc.startd's manifest
 # import. tmpfs grows out of the same memory on demand and costs nothing when
 # unused. The ramdisk stays unmounted and available at /devices/ramdisk:a,

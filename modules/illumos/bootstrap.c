@@ -54,6 +54,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -140,11 +141,11 @@
  * stands: every entry under /etc or /var would be EROFS, and the ones that
  * matter would be missing rather than merely noisy.
  *
- * What replaces it is: mount tmpfs on /var and /tmp first (see mount_tmpfs()),
- * then make the directories INSIDE those.  /etc entries are not here at all --
- * anything under /etc that has to be writable is a symlink into
- * /etc/svc/volatile, staged into the exported root tree the same way /etc/dev
- * already is for devfsadm.
+ * What replaces it is: mount tmpfs on /var, /tmp and /run first (see
+ * mount_tmpfs() and mount_run()), then make the directories INSIDE those.
+ * /etc entries are not here at all -- anything under /etc that has to be
+ * writable is a symlink into /etc/svc/volatile, staged into the exported root
+ * tree the same way /etc/dev already is for devfsadm.
  *
  * /nix and /nix/store are NOT here, and their absence is the same reasoning
  * inverted.  mount(2) does not create its target, so on a ramdisk root they
@@ -382,6 +383,46 @@ remount_root_rw(void)
 
 #ifdef	ROOT_VIRTIOFS
 /*
+ * tmpfs on /run, with /run/current-system carried across it.
+ *
+ * /run is not merely conventional here: services write into it. nginx does
+ * `mkdir -p /run/nginx` and then opens /run/nginx/nginx.pid; the suid-sgid
+ * wrappers service builds its whole bin directory under /run/wrappers. On the
+ * read-only export both fail, and the failures do not look like a read-only
+ * root -- what reaches the log is
+ *
+ *     nginx: [emerg] open() "/run/nginx/nginx.pid" failed (2: No such file...)
+ *     ln: failed to create symbolic link '/run/wrappers/bin' -> ''
+ *
+ * with nginx then restarting about once a second for ever. So /run gets the
+ * same treatment as /var and /tmp.
+ *
+ * The complication is that /run is not empty on the export: the boot archive
+ * stages /run/current-system pointing at the system closure (see
+ * `bootArchive.symlinks` in illumos-boot-image.nix), and a tmpfs mounted over
+ * /run would hide it. Rather than teach this program the toplevel path -- it
+ * has no business knowing it -- read the link before the mount and write it
+ * back afterwards. If it is not there, there is nothing to preserve and the
+ * mount is all that happens.
+ */
+static void
+mount_run(void)
+{
+	char target[PATH_MAX];
+	ssize_t n;
+
+	n = readlink("/run/current-system", target, sizeof (target) - 1);
+	if (n > 0)
+		target[n] = '\0';
+
+	mount_tmpfs("/run");
+
+	if (n > 0 && symlink(target, "/run/current-system") != 0 &&
+	    errno != EEXIST)
+		step_failed("symlink /run/current-system", errno);
+}
+
+/*
  * Give /dev a writable attribute store.
  *
  * This is the second half of the writability problem, and the half that is not
@@ -484,6 +525,69 @@ dev_attrdir(void)
 	args.sdev_attrdir = (uint64_t)(uintptr_t)path;
 	optbuf[0] = '\0';
 
+	/*
+	 * A FRESH MOUNT, NOT MS_REMOUNT, and this is the difference between a
+	 * machine with a network and one without.
+	 *
+	 * /dev/net, /dev/ipnet and /dev/pts are not devfsadm symlinks. They are
+	 * DYNAMIC directories synthesised by the kernel -- `vtab[]` in
+	 * sdev_subr.c marks them SDEV_DYNAMIC, and their contents come from
+	 * devnet_vnodeops and friends rather than from any backing store. The
+	 * one and only thing that creates them is sdev_filldir_dynamic(), and
+	 * sdev_mount() calls it from exactly one place: the initial-mount path,
+	 * at sdev_vfsops.c:363.
+	 *
+	 * The MS_REMOUNT path never gets there. It does sdev_stale() on the
+	 * root -- which deletes every entry, the dynamic directories included,
+	 * and sets SDEV_BUILD -- swaps sdev_attrvp, and `goto cleanup`s out
+	 * (sdev_vfsops.c:281-306). The rebuild that SDEV_BUILD then triggers is
+	 * sdev_filldir(), which reads the ATTRIBUTE STORE. Nothing in the
+	 * attribute store is named `net`, nothing ever will be, and devfsadm
+	 * cannot help: it does not create these directories either.
+	 *
+	 * So a remounted /dev loses /dev/net permanently, and the symptom is a
+	 * networking one with no networking in it. libdlpi's dlpi_open() opens
+	 * /dev/net/<link>; without the directory it fails, and what reaches the
+	 * console is
+	 *
+	 *     ifconfig: cannot plumb vioif0: Could not open DLPI link
+	 *     ifconfig: error: vioif0: no such interface
+	 *
+	 * from an `svc:/network/physical:default` that then exits 0 and goes
+	 * online. Everything else works -- svc.startd, svc.configd, sshd all
+	 * come up, sshd really is listening on 22 -- and the machine is simply
+	 * unreachable, because the NIC never got an address. `/dev/vioif0` is
+	 * present the whole time (devfsadm makes that one), which is the detail
+	 * that sends you looking at the driver.
+	 *
+	 * Mounting a second `dev` instance over /dev takes the initial-mount
+	 * path instead: sdev_mkroot() sees the mount point spelled "/dev" and
+	 * sets SDEV_GLOBAL (sdev_subr.c:473), so sdev_filldir_dynamic() runs
+	 * and the dynamic directories exist. The old instance stays underneath,
+	 * covered and unreferenced; nothing unmounts it, because everything
+	 * holding /dev open at this moment is this process.
+	 *
+	 * The `..` trap described above is unchanged by this and is handled the
+	 * same way -- vfs_vnodecovered points at the previous /dev either way,
+	 * and the same DEV_ATTRDIR/devices symlink makes "../devices" land in
+	 * the right place.
+	 *
+	 * MS_REMOUNT is kept as a fallback rather than deleted. It is what this
+	 * code did before, it does produce a writable /dev, and a machine that
+	 * boots without a network is worth more than one that does not boot.
+	 */
+	if (mount("/dev", "/dev", MS_DATA | MS_OPTIONSTR | MS_OVERLAY, "dev",
+	    (char *)&args, sizeof (args), optbuf, sizeof (optbuf)) == 0) {
+		say("bootstrap: /dev attribute store on %s [%s]\n",
+		    DEV_ATTRDIR, optbuf);
+		return;
+	}
+
+	say("bootstrap: /dev fresh mount failed (%s); falling back to "
+	    "remount\n", strerror(errno));
+
+	optbuf[0] = '\0';
+
 	if (mount("/dev", "/dev", MS_REMOUNT | MS_DATA | MS_OPTIONSTR, "dev",
 	    (char *)&args, sizeof (args), optbuf, sizeof (optbuf)) != 0) {
 		step_failed("remount /dev with an attribute store", errno);
@@ -492,8 +596,9 @@ dev_attrdir(void)
 		return;
 	}
 
-	say("bootstrap: /dev attribute store on %s [%s]\n", DEV_ATTRDIR,
-	    optbuf);
+	say("bootstrap: /dev attribute store on %s [%s] -- REMOUNTED, so "
+	    "/dev/net does not exist and the NIC cannot be plumbed\n",
+	    DEV_ATTRDIR, optbuf);
 }
 
 /*
@@ -771,6 +876,7 @@ main(int argc, char **argv)
 #ifdef	ROOT_VIRTIOFS
 	mount_tmpfs("/var");
 	mount_tmpfs("/tmp");
+	mount_run();
 	dev_attrdir();
 #else
 	remount_root_rw();

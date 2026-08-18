@@ -2,6 +2,7 @@
   config,
   lib,
   pkgs,
+  utils,
   ...
 }:
 
@@ -219,6 +220,165 @@ let
         roots = lib.optional (next.root != null) next.root;
       };
 
+  # ------------------------------------------------------------------
+  # /etc/passwd, /etc/group and /etc/shadow, generated at BUILD time from
+  # `config.users.users` / `config.users.groups`.
+  #
+  # These three files used to be literal strings a few hundred lines below,
+  # which meant `users.users` did not reach this image at all: every account
+  # any module declared -- notably the per-service `m-<service>` accounts the
+  # modular-service lowering in system/service/illumos/system.nix creates --
+  # simply did not exist, and svc.startd put the service straight into
+  # maintenance:
+  #
+  #     Could not interpret "user" property value "m-hello", error 2.
+  #
+  # error 2 being ENOENT out of getpwnam().
+  #
+  # The other way to fix that is to re-enable the `users` activation script
+  # and teach update-users-groups.pl about illumos. That is not what this
+  # does, for two reasons. First, this is an immutable image: the root
+  # filesystem is a ramdisk rebuilt from the store on every boot, so runtime
+  # id allocation has nothing to be stable *across* -- it would re-derive the
+  # same answer every boot from the same input, which is the definition of a
+  # build-time computation. Second, the script's job is to reconcile a
+  # *mutable* /etc/passwd with the declared one, and it does that by writing a
+  # BSD-style /etc/master.passwd that illumos does not have, and by
+  # regenerating passwd/shadow/group over whatever is there -- including
+  # root's empty password field, which is the only way into this VM (see
+  # doc/illumos-ssh.md). Generating the files here keeps that field
+  # declarative -- `boot.illumos.shadowPasswords` -- rather than at the mercy
+  # of a Perl script's idea of what a locked account looks like.
+  #
+  # uid/gid allocation is the one thing the runtime path gives for free.
+  # `users.users.<name>.uid` may be null, meaning "pick a free one on
+  # activation"; there is no activation for this, so pick one here,
+  # deterministically: sorted by name, counting up from
+  # `boot.illumos.firstAllocatedId`, skipping anything already claimed.
+  # Stable as long as the set of unnumbered accounts is, and an account whose
+  # id must not move can always be given one explicitly.
+
+  firstFree = taken: n: if lib.elem n taken then firstFree taken (n + 1) else n;
+
+  allocateIds =
+    taken: names:
+    (lib.foldl'
+      (
+        acc: name:
+        let
+          id = firstFree acc.taken acc.cursor;
+        in
+        {
+          taken = acc.taken ++ [ id ];
+          cursor = id + 1;
+          out = acc.out // {
+            ${name} = id;
+          };
+        }
+      )
+      {
+        inherit taken;
+        cursor = cfg.firstAllocatedId;
+        out = { };
+      }
+      names
+    ).out;
+
+  unnumbered =
+    attr: set: lib.sort (a: b: a < b) (lib.attrNames (lib.filterAttrs (_: e: e.${attr} == null) set));
+  claimed = attr: set: lib.filter (x: x != null) (lib.mapAttrsToList (_: e: e.${attr}) set);
+
+  allocatedUids = allocateIds (claimed "uid" config.users.users) (
+    unnumbered "uid" config.users.users
+  );
+  allocatedGids = allocateIds (claimed "gid" config.users.groups) (
+    unnumbered "gid" config.users.groups
+  );
+
+  uidOf =
+    name:
+    let
+      u = config.users.users.${name};
+    in
+    if u.uid != null then u.uid else allocatedUids.${name};
+
+  gidOf =
+    name:
+    let
+      g = config.users.groups.${name};
+    in
+    if g.gid != null then g.gid else allocatedGids.${name};
+
+  primaryGidOf =
+    u:
+    if u.group == "" then
+      throw "users.users.${u.name}.group is unset; /etc/passwd has no way to spell that"
+    else if !(config.users.groups ? ${u.group}) then
+      throw "users.users.${u.name}.group is \"${u.group}\", which is not in users.groups"
+    else
+      gidOf u.group;
+
+  # Keep the accounts illumos itself expects at the top of the file, in the
+  # order a stock /etc/passwd has them, and put everything else after in name
+  # order. Purely cosmetic -- nothing reads these positionally -- but it makes
+  # a diff of a generated file readable.
+  stockOrder = [
+    "root"
+    "daemon"
+    "bin"
+    "sys"
+    "adm"
+    "lp"
+    "uucp"
+    "nuucp"
+    "smmsp"
+    "listen"
+    "sshd"
+    "webservd"
+    "nginx"
+    "unknown"
+    "nobody"
+    "noaccess"
+    "nobody4"
+  ];
+
+  orderNames =
+    set:
+    let
+      names = lib.attrNames set;
+    in
+    lib.filter (n: lib.elem n names) stockOrder
+    ++ lib.sort (a: b: a < b) (lib.filter (n: !(lib.elem n stockOrder)) names);
+
+  # getpwent(3C) field order:
+  #   name:password:uid:gid:gecos:home:shell
+  # The password field is always "x": the real one is in /etc/shadow, and
+  # nss_files reads the two databases separately.
+  passwdText = lib.concatMapStrings (
+    name:
+    let
+      u = config.users.users.${name};
+      shell = if u.shell == null then "" else utils.toShellPath u.shell;
+    in
+    "${u.name}:x:${toString (uidOf name)}:${toString (primaryGidOf u)}:${u.description}:${u.home}:${shell}\n"
+  ) (orderNames config.users.users);
+
+  # getgrent(3C): name:password:gid:members
+  groupText = lib.concatMapStrings (
+    name:
+    let
+      g = config.users.groups.${name};
+    in
+    "${g.name}::${toString (gidOf name)}:${lib.concatStringsSep "," g.members}\n"
+  ) (orderNames config.users.groups);
+
+  # getspent(3C): name:password:lastchg:min:max:warn:inactive:expire:flag.
+  # Everything after the password is left empty, which is what a fresh
+  # illumos install writes for an account with no ageing policy.
+  shadowText = lib.concatMapStrings (
+    name: "${config.users.users.${name}.name}:${cfg.shadowPasswords.${name} or "NP"}:::::::\n"
+  ) (orderNames config.users.users);
+
   # Guest RAM, in MB. See the note above `system.build.vm`.
   memMB = config.virtualisation.memorySize or (if cfg.bootArchive.minimal then 2048 else 6144);
 in
@@ -253,6 +413,42 @@ in
         program, it BAKES ONE IN, as
         `-DPROG='"''${bashInteractive}/bin/bash"'`; this module builds the
         directory that override needs.
+      '';
+    };
+
+    firstAllocatedId = mkOption {
+      type = types.int;
+      default = 800;
+      description = ''
+        The first uid/gid handed out to an account that `users.users` /
+        `users.groups` left unnumbered.
+
+        Allocation happens at build time here, not at activation -- see the
+        note above `passwdText` -- so this is where the "system id" range for
+        this image is chosen. 800 is above everything a stock illumos install
+        claims for itself and well below the 60001/60002 `nobody`/`noaccess`
+        pair.
+      '';
+    };
+
+    shadowPasswords = mkOption {
+      type = types.attrsOf types.str;
+      default = { };
+      example = lib.literalExpression ''{ root = "NP"; }'';
+      description = ''
+        The `/etc/shadow` password field, keyed by account name. Accounts not
+        named here get `NP`.
+
+        The three values illumos gives meaning to are a crypt(3C) hash, `NP`
+        ("no password" -- password login impossible, key login unaffected),
+        and `*LK*` (account locked, which OpenSSH's `allowed_user()` refuses
+        outright, before ever reading authorized_keys). The empty string is a
+        fourth: it means no password is *required*.
+
+        This is not `users.users.<name>.hashedPassword` because it cannot be:
+        a build host's crypt(3) does not produce anything illumos' crypt(3C)
+        can verify, so any hash NixOS computed here would be unusable. See
+        the note on `etc/shadow` below.
       '';
     };
 
@@ -728,12 +924,10 @@ in
     # in order and waits for each -- which is also the honest description of
     # where activation belongs on this OS.
     boot.illumos.activation.sysinitLine = lib.optionalString cfg.activation.enable ''
-      act::sysinit:${
-        pkgs.writeScript "illumos-activate" ''
-          #!${pkgs.bashInteractive}/bin/bash
-          . ${config.system.build.toplevel}/activate
-        ''
-      }
+      act::sysinit:${pkgs.writeScript "illumos-activate" ''
+        #!${pkgs.bashInteractive}/bin/bash
+        . ${config.system.build.toplevel}/activate
+      ''}
     '';
 
     # Two of the stock activation scripts cannot run here, and both are
@@ -747,15 +941,150 @@ in
     # loudly -- and with activation now actually running it would fail loudly
     # on every boot.
     #
-    # `users` runs update-users-groups.pl, which needs no useradd and would in
-    # fact work. It is off because it would REWRITE /etc/passwd, /etc/shadow
-    # and /etc/group, and this image writes those three by hand precisely so
-    # root's password field can be empty -- the login path documented in
-    # doc/illumos-ssh.md. Letting the module regenerate them locks the machine
-    # out of itself. Turning it back on means teaching the users module about
-    # this image's accounts; it is not a matter of deleting the line.
+    # `users` runs update-users-groups.pl. It is off because that script's job
+    # is to reconcile a mutable /etc/passwd with the declared one on a running
+    # system, and this image has no mutable /etc/passwd to reconcile: the root
+    # filesystem is a ramdisk rebuilt from the store on every boot, so the
+    # declared state is the only state there has ever been. The three files
+    # are generated at build time instead -- see the note above `passwdText`
+    # -- which is where the declared state already is. Left on, the script
+    # would additionally write a BSD-style /etc/master.passwd that illumos
+    # does not have, and would overwrite root's empty password field, locking
+    # the machine out of itself.
+    #
+    # `users.users` and `users.groups` are NOT ignored any more, which is the
+    # whole point: they are the input to that generation.
     system.activationScripts.cap_mkdb = lib.mkForce "";
     system.activationScripts.users = lib.mkForce "";
+
+    # ------------------------------------------------------------------
+    # The accounts a stock illumos expects, with the uids and gids a stock
+    # illumos gives them. These used to be text inside the /etc/passwd
+    # literal; they are option values now, so that the generator reproduces
+    # the same file and so that everything else reading `users.users` -- the
+    # SMF `user` credential, nss_files, sshd -- sees the same numbers.
+    #
+    # nixpkgs' `ids.uids`/`ids.gids` is a NixOS table and disagrees on
+    # several: nginx 60 vs 65, nobody 65534 vs 60001, `_shadow` sitting on
+    # illumos' nginx gid, and no bin/sys/noaccess at all. Hence the mkForces.
+    users.users = {
+      root = {
+        uid = lib.mkForce 0;
+        group = lib.mkForce "root";
+        description = lib.mkForce "Super-User";
+        home = lib.mkForce "/";
+
+        # Not `/run/current-system/sw/bin/bash`, which is what
+        # `utils.toShellPath` produces for a shell package: /bin is a symlink
+        # into `system.path` staged directly in the boot archive, and it
+        # resolves one mount earlier than /run/current-system does. Root's
+        # login shell is the one whose failure is unrecoverable, so it gets
+        # the earlier path.
+        shell = lib.mkForce "/bin/sh";
+
+        # Stock /etc/group has root in bin, sys and adm.
+        extraGroups = [
+          "bin"
+          "sys"
+          "adm"
+        ];
+      };
+
+      # gid 1 is `other`. illumos has no `daemon` group.
+      daemon = {
+        uid = lib.mkForce 1;
+        group = lib.mkForce "other";
+        description = lib.mkForce "";
+        home = lib.mkForce "/";
+        shell = lib.mkForce null;
+        extraGroups = [
+          "bin"
+          "adm"
+        ];
+      };
+
+      bin = {
+        uid = 2;
+        group = "bin";
+        isSystemUser = true;
+        home = "/usr/bin";
+        shell = null;
+        extraGroups = [ "sys" ];
+      };
+
+      sys = {
+        uid = 3;
+        group = "sys";
+        isSystemUser = true;
+        home = "/";
+        shell = null;
+      };
+
+      nobody = {
+        uid = lib.mkForce 60001;
+        group = lib.mkForce "nobody";
+        description = lib.mkForce "NFS Anonymous Access User";
+        home = lib.mkForce "/";
+        shell = lib.mkForce null;
+      };
+
+      noaccess = {
+        uid = 60002;
+        group = "noaccess";
+        isSystemUser = true;
+        description = "No Access User";
+        home = "/";
+        shell = null;
+      };
+    }
+    // lib.optionalAttrs config.services.openssh.enable {
+      sshd = {
+        uid = lib.mkForce 22;
+        description = lib.mkForce "sshd privsep";
+        shell = lib.mkForce "/bin/false";
+      };
+    }
+    // lib.optionalAttrs config.services.nginx.enable {
+      nginx = {
+        uid = lib.mkForce 65;
+        description = lib.mkForce "nginx web server";
+        shell = lib.mkForce "/bin/false";
+      };
+    };
+
+    users.groups = {
+      root.gid = lib.mkForce 0;
+      other.gid = 1;
+      bin.gid = 2;
+      sys.gid = 3;
+      adm.gid = 4;
+      nobody.gid = 60001;
+      noaccess.gid = 60002;
+
+      # nixpkgs puts `_shadow` on gid 65, which is illumos' nginx. It is a
+      # shadow(8) implementation detail with no meaning on this platform, so
+      # let it be allocated rather than fight it for the number.
+      # Likewise `wheel`, which nixpkgs puts on gid 1 -- illumos's `other`.
+      # sudo/doas name the group, not the number.
+      _shadow.gid = lib.mkForce null;
+      wheel.gid = lib.mkForce null;
+
+      # Stock /etc/group memberships that `extraGroups` cannot express,
+      # because `adm` names an account this image does not create and stock
+      # illumos lists it anyway. `members` is a list, so this adds to
+      # whatever `extraGroups` contributed rather than replacing it.
+      sys.members = [ "adm" ];
+    }
+    // lib.optionalAttrs config.services.openssh.enable { sshd.gid = lib.mkForce 22; }
+    // lib.optionalAttrs config.services.nginx.enable { nginx.gid = lib.mkForce 65; };
+
+    # The empty field is this VM's login path; everything else defaults to
+    # `NP`. Both are explained at `etc/shadow` below.
+    boot.illumos.shadowPasswords = {
+      root = "";
+      nobody = "*LK*";
+      noaccess = "*LK*";
+    };
 
     # main.c's `init-path` boot property defaults to /sbin/init
     # (uts/common/os/main.c:140, zone_initname), and the boot archive is the
@@ -1048,26 +1377,23 @@ in
         10.0.2.0        255.255.255.0
       '';
 
-      "etc/passwd" = ''
-        root:x:0:0:Super-User:/:/bin/sh
-        daemon:x:1:1::/:
-        bin:x:2:2::/usr/bin:
-        sys:x:3:3::/:
-        nobody:x:60001:60001:NFS Anonymous Access User:/:
-        sshd:x:22:22:sshd privsep:/var/empty:/bin/false
-        nginx:x:65:65:nginx web server:/var/empty:/bin/false
-        noaccess:x:60002:60002:No Access User:/:
-      '';
+      # The three account databases. Generated, not literal -- see the note
+      # above `passwdText` for why they are built here rather than by the
+      # `users` activation script, and `boot.illumos.firstAllocatedId` for how
+      # unnumbered accounts get their ids. The stock illumos uids and gids
+      # they used to carry as text are now pinned on `users.users` /
+      # `users.groups` further down, so the generated files reproduce them.
+      "etc/passwd" = passwdText;
 
       # No hash is invented here: the build host has no crypt(3) producing
       # illumos' $5$ SHA-256 form, so any hash written now would be
-      # unverifiable. Password login is impossible by construction, which is
-      # the intent -- authentication is by key.
+      # unverifiable. Password login is impossible by construction for every
+      # account but root, which is the intent -- authentication is by key.
       #
-      # root gets `NP`, not `*LK*`, and the distinction is load-bearing.
-      # `*LK*` is illumos' *locked account* marker and OpenSSH knows it:
-      # configure sets LOCKED_PASSWD_STRING="*LK*" on this platform, and
-      # allowed_user() (auth.c) refuses any account whose shadow password
+      # The daemon accounts get `NP`, not `*LK*`, and the distinction is
+      # load-bearing. `*LK*` is illumos' *locked account* marker and OpenSSH
+      # knows it: configure sets LOCKED_PASSWD_STRING="*LK*" on this platform,
+      # and allowed_user() (auth.c) refuses any account whose shadow password
       # equals it -- before ever consulting authorized_keys. A public-key
       # login then fails as nothing more informative than
       #
@@ -1083,12 +1409,12 @@ in
       # *shadow* entry, not the passwd one.
       #
       # `NP` ("no password") is illumos' marker for an account that cannot be
-      # logged into with a password but is not locked. The daemon accounts
-      # below carry it; it leaves key authentication alone.
+      # logged into with a password but is not locked. It leaves key
+      # authentication alone, and it is the default in `shadowPasswords`.
       #
-      # root's field is EMPTY, which is different: empty means "no password
-      # REQUIRED", so `ssh root@127.0.0.1` gets a shell with nothing typed and
-      # no key to manage. Paired with `PermitEmptyPasswords` in
+      # root's field is EMPTY, which is different again: empty means "no
+      # password REQUIRED", so `ssh root@127.0.0.1` gets a shell with nothing
+      # typed and no key to manage. Paired with `PermitEmptyPasswords` in
       # `configurations/illumos-full`. This is a scratch VM reachable only
       # through a qemu user-mode forward on 127.0.0.1, and being trivially
       # enterable is the point while the OS underneath is the thing being
@@ -1100,41 +1426,14 @@ in
       # /etc/security/crypt.conf and the matching
       # /usr/lib/security/crypt_sha256.so.1, and this image ships neither. That
       # leaves only the built-in traditional DES algorithm, which modern
-      # libxcrypt will not even generate any more.
-      #
-      # This literal string, not `users.users.*` / `update-users-groups.pl`,
-      # is the entire source of truth for illumos' `/etc/shadow`, and it is
-      # kept that way on purpose. `system.activationScripts` DOES run now (see
-      # `boot.illumos.activation` above), but its `users` script is force-
-      # disabled: that NixOS module writes a BSD-style `/etc/master.passwd`
-      # and would regenerate passwd/shadow/group over the three written here,
-      # taking the empty password field with it and locking the machine out of
-      # itself. So `users.users.root.initialPassword` and friends remain
-      # no-ops here -- confirmed by reading a live guest's `/etc/shadow`, which
-      # showed `NP` for root regardless. `illumos-base` used to set it to
-      # "toor"; that line was removed rather than left to lie.
-      "etc/shadow" = ''
-        root::::::::
-        daemon:NP:::::::
-        bin:NP:::::::
-        sys:NP:::::::
-        sshd:NP:::::::
-        nginx:NP:::::::
-        nobody:*LK*:::::::
-        noaccess:*LK*:::::::
-      '';
+      # libxcrypt will not even generate any more. So
+      # `users.users.root.hashedPassword` is not the knob here and cannot be;
+      # `boot.illumos.shadowPasswords` is. `illumos-base` used to set
+      # `initialPassword = "toor"`; that line was removed rather than left to
+      # lie.
+      "etc/shadow" = shadowText;
 
-      "etc/group" = ''
-        root::0:
-        other::1:
-        bin::2:root,daemon
-        sys::3:root,bin,adm
-        adm::4:root,daemon
-        sshd::22:
-        nginx::65:
-        nobody::60001:
-        noaccess::60002:
-      '';
+      "etc/group" = groupText;
 
       # RBAC authorisations. Being uid 0 is *not* sufficient on illumos: a
       # privileged operation asks `chkauthattr()`, which looks the caller up by

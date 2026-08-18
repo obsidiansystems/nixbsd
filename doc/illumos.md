@@ -92,16 +92,16 @@ There are two further variants:
   It needs a qemu carrying `multiboot-page-align-modules.patch`, which nixpkgs applies here.
   This is similar to how NixOS tests work.
 
-  The virtiofs kernel module is newly vibe-coded blind.
-  I would not trust it in production!
-  But especially in read-only mode, it seems fine for testing.
-
 - **`illumos-base-virtiofs-root`** makes the host share the *root* filesystem, not just the store.
   It boots to a shell.
   The full version of this does not work yet; `svc.startd` starts and goes quiet.
 
 Note that the store-location axis is not the filesystem type: both families use UFS for the boot archive.
 The virtio-fs ones need a hypervisor, so the **non**-virtiofs configurations are the ones that could eventually boot on real hardware.
+
+The virtiofs kernel module is newly vibe-coded blind.
+I would not trust it in production!
+But especially in read-only mode, it seems fine for testing.
 
 ## When it does not work
 

@@ -765,7 +765,14 @@ in
         // listToAttrs (map configureAddrs interfaces)
       );
 
-    boot.kernel.sysctl = {
+    # `net.inet6.*` is the BSD spelling, and these are set unconditionally,
+    # which on illumos is not merely inert: it makes `boot.kernel.sysctl`
+    # non-empty, which is the guard the sysctl module keys its services off,
+    # so illumos ended up with two sysctl services running a tool it does not
+    # have. illumos tunes IPv6 temporary addresses through
+    # `ipadm set-prop` on the interface, not through a sysctl-style tree, so
+    # there is nothing to write here at all.
+    boot.kernel.sysctl = lib.mkIf (!pkgs.stdenv.hostPlatform.isSunOS) {
       "net.inet6.ip6.use_tempaddr" = tempaddrValues.${cfg.tempAddresses}.use_tempaddr;
       "net.inet6.ip6.prefer_tempaddr" = tempaddrValues.${cfg.tempAddresses}.prefer_tempaddr;
     };

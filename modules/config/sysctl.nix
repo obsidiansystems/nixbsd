@@ -47,16 +47,31 @@ in
 
   config =
     let
+      # `null` where the platform has no sysctl(8) at all. It used to be
+      # "/no-sysctl-on-illumos" -- a path chosen to fail loudly -- but nothing
+      # was gated on it, so the services below were still defined and illumos
+      # simply ran it:
+      #
+      #     svc:/site/sysctl:default           maintenance
+      #     svc:/site/sysctl-lastload:default  maintenance
+      #     Start method failed repeatedly, last exited with status 127
+      #
+      # on every boot. 127 is command-not-found. Two permanently broken
+      # services are worse than none: `svcs -xv` is how you find a service
+      # that is genuinely wrong, and it stops being useful once it always has
+      # something in it.
       sysctlBin =
         {
           freebsd = "${pkgs.freebsd.sysctl}/bin/sysctl";
           openbsd = "${pkgs.openbsd.sysctl}/bin/sysctl";
-          # illumos has no sysctl(8); /etc/system is the rough analogue.
-          solaris = "/no-sysctl-on-illumos";
+          # illumos has no sysctl(8). /etc/system is the rough analogue, and
+          # it is read by the kernel at boot rather than by a userland tool,
+          # so there is nothing for these services to run.
+          solaris = null;
         }
         .${pkgs.stdenv.hostPlatform.parsed.kernel.name};
     in
-    mkIf (cfg != { }) {
+    mkIf (cfg != { } && sysctlBin != null) {
 
       environment.etc."sysctl.conf".text = concatStrings (
         mapAttrsToList (

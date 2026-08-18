@@ -87,6 +87,31 @@ in
     '';
   };
 
+
+  options.boot.illumos.bootstrap.storeMountPoint = mkOption {
+    type = types.str;
+    default = "/nix/store";
+    description = ''
+      Where `bootstrap` mounts the host's store.
+
+      /nix/store, and that is not a detail. Everything the boot archive stages
+      lives at its REAL store path, because `PT_INTERP` and `DT_RUNPATH` are
+      absolute; a store mounted anywhere else resolves none of it. The first
+      version of this mounted on /mnt/store, which proved the transport worked
+      and ran nothing: `illumos-base-virtiofs` reached its real init(8), which
+      then could not exec /sbin/sh, because that symlink points into
+      /nix/store and /nix/store was the archive's near-empty copy.
+
+      Mounting over the archive's own /nix/store is safe rather than clever.
+      The host directory is a superset of what was staged -- everything in the
+      archive was built on the host and is still there under the same path --
+      and anything already mapped keeps the mapping it opened.
+
+      Set it elsewhere to look at the transport without letting it take over
+      the system's own store.
+    '';
+  };
+
   config = mkIf (cfg.bootstrap.enable && haveBootstrap) {
     # The hook the whole design turns on: `preExec` is "a program to run as, or
     # instead of, the thing /sbin/init would have exec'd", given what that
@@ -100,6 +125,7 @@ in
       next:
       pkgs.illumos.callPackage ./bootstrap-package.nix {
         inherit next network;
+        storeDir = cfg.bootstrap.storeMountPoint;
       };
 
     # The two /etc entries devfsadm needs, which have to be baked into the

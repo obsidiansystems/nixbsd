@@ -32,6 +32,13 @@
   #     merely untidy.
   next ? null,
 
+  # Where the virtio-fs store is mounted. /nix/store, because everything the
+  # archive stages lives at its real store path (PT_INTERP and DT_RUNPATH are
+  # absolute) and a store mounted anywhere else resolves none of it -- it
+  # proves the transport and runs nothing. See the STORE_DIR comment in
+  # ./bootstrap.c.
+  storeDir ? "/nix/store",
+
   # Optional network bring-up, as
   #
   #   { dlmgmtd = ...; ifconfig = ...; setaddr = ...;
@@ -132,6 +139,8 @@ mkDerivation {
         -DDEVFSADM='"${lib.getExe devfsadm}"' \
         -DSOCONFIG='"${lib.getExe soconfig}"' \
         -DSOCONFIG_DIR='"${soconfig}/etc/sock2path.d"' \
+        -DSTORE_DIR='"${storeDir}"' \
+        -DSTORE_PARENT='"${dirOf storeDir}"' \
         ${
           lib.optionalString (next != null) ''
             -DNEXT_PROG='"${next.path}"' \

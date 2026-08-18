@@ -73,8 +73,33 @@
 #define	STORE_TAG	"store"
 #endif
 
+/*
+ * Where the store lands.
+ *
+ * /nix/store, and the address is the whole point rather than a detail:
+ * everything staged in the boot archive lives at its REAL store path, because
+ * PT_INTERP and DT_RUNPATH are absolute. A store mounted anywhere else
+ * resolves none of them -- it proves the transport works and runs nothing.
+ * That is what /mnt/store, the first mountpoint this used, bought: a
+ * `illumos-base-virtiofs` whose init started and then could not exec /sbin/sh,
+ * because the shell it names is in /nix/store and /nix/store was the archive
+ * copy with nothing in it.
+ *
+ * Mounting over the archive's own /nix/store is safe, and is not a trick: the
+ * host directory is a SUPERSET of it. Everything the archive staged was built
+ * on the host and is still there under the same path, and anything already
+ * mapped -- ld.so.1 and libc, which this program is running out of -- keeps
+ * the mapping it opened before the mount.
+ *
+ * STORE_PARENT is spelled separately because mkdir(2) creates one level; see
+ * the dirs[] list.
+ */
 #ifndef	STORE_DIR
-#define	STORE_DIR	"/mnt/store"
+#define	STORE_DIR	"/nix/store"
+#endif
+
+#ifndef	STORE_PARENT
+#define	STORE_PARENT	"/nix"
 #endif
 
 /*
@@ -97,9 +122,13 @@
  *   /etc/dladm             dlmgmtd wants a writable datalink.conf here.
  *   /var/run               conventional, and several daemons assume it.
  *   /var/empty             sshd's privilege-separation chroot.
- *   /mnt, /mnt/store       the virtio-fs mountpoint. mount(2) does not create
+ *   /nix, /nix/store       the virtio-fs mountpoint. mount(2) does not create
  *                          its target; without this the mount fails ENOENT and
- *                          looks like a transport problem.
+ *                          looks like a transport problem. Both exist in the
+ *                          boot archive already -- the staged closure is at its
+ *                          real store path -- so these two are almost always
+ *                          EEXIST. They are named anyway because "almost" is
+ *                          not a property to bet a boot on.
  */
 static const char *const dirs[] = {
 	"/etc",
@@ -110,7 +139,7 @@ static const char *const dirs[] = {
 	"/var",
 	"/var/run",
 	"/var/empty",
-	"/mnt",
+	STORE_PARENT,
 	STORE_DIR,
 	NULL
 };

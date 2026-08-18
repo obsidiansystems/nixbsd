@@ -238,6 +238,54 @@ let
   # A file name for a manifest: svc:/site/nginx -> site/nginx.xml
   manifestPath = svc: "${svc.name}.xml";
 
+  # Build-time validation of the generated manifests.
+  #
+  # What this is *not*: `svccfg validate`. That runs libscf's template engine
+  # -- property groups checked against the types their templates declare,
+  # required properties, cardinalities, value constraints -- and it needs a
+  # bound repository handle, because template validation composes a manifest
+  # against the templates already in the repository (`tmpl_validate_bundle`
+  # calls `lscf_prep_hndl`, cmd/svc/svccfg/svccfg_tmpl.c:4017). A repository
+  # handle means a running svc.configd, and svc.configd is an illumos binary
+  # that speaks doors. Nothing can run it on the Linux machine that builds
+  # this derivation, so the semantic half of validation cannot happen here. It
+  # happens where the manifests are imported, at boot, in ../illumos-smf.nix.
+  #
+  # What this *is*: DTD validation against the very DTD svccfg itself parses
+  # with -- cmd/svc/dtd/service_bundle.dtd.1, shipped in `illumos.svccfg`.
+  # That is worth having on its own, because the failure mode this renderer
+  # actually has is structural: an element the DTD does not declare, a
+  # misspelled attribute, or children in the wrong order, the DTD's content
+  # models being sequences and not choices. Each of those makes `svccfg
+  # import` answer "Document is not valid" at boot and then import *nothing at
+  # all*, so the symptom is a system with no services rather than a complaint
+  # about the one manifest at fault.
+  #
+  # `--valid --path <dtddir>` rather than `--dtdvalid <file>`: the manifests
+  # carry a DOCTYPE naming the illumos system path
+  # /usr/share/lib/xml/dtd/service_bundle.dtd.1, and `--path` is what lets
+  # libxml2 resolve that by base name out of the store. As of libxml2 2.15
+  # `--dtdvalid` reports only "does not validate", where `--valid` still
+  # prints the offending element and line.
+  dtdPackage = pkgs.illumos.svccfg or null;
+
+  # `or null` throughout this file's neighbours for the same reason: the
+  # module has to stay evaluable against a nixpkgs that has not packaged
+  # svccfg yet. Without the DTD there is simply no check.
+  validateManifests = optionalString (dtdPackage != null) ''
+    echo "smf-manifests: DTD-validating $(find $out -name '*.xml' | wc -l) manifests"
+    failed=
+    for manifest in $(find $out -name '*.xml' | sort); do
+      ${lib.getBin pkgs.buildPackages.libxml2}/bin/xmllint --noout --nonet \
+        --path ${dtdPackage}/share/lib/xml/dtd --valid "$manifest" \
+        || failed="$failed $manifest"
+    done
+    if [ -n "$failed" ]; then
+      echo "smf-manifests: invalid against service_bundle.dtd.1:$failed" >&2
+      exit 1
+    fi
+  '';
+
   # buildPackages: a manifest is pure text. Building it with the cross stdenv
   # would make `smf.manifests` depend on a cross-compiled bash and coreutils,
   # neither of which builds for illumos yet.
@@ -251,6 +299,7 @@ let
         ln -s ${svc.manifest} "$out/${manifestPath svc}"
       '') cfg.services
     )
+    + validateManifests
   );
 
   # Option types -------------------------------------------------------------

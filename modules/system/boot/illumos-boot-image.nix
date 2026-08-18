@@ -1195,6 +1195,49 @@ in
           for f in name_to_sysnum minor_perm driver_classes dacf.conf mach; do
             cp ${gate}/usr/src/uts/intel/os/$f ba/etc/
           done
+          # /etc/security/device_policy, from the same uts/intel/os directory.
+          #
+          # illumos enforces a privilege check on device open that is entirely
+          # separate from file permissions, and this file is where the policy
+          # comes from. Its FIRST line is the default:
+          #
+          #     *  read_priv_set=none  write_priv_set=none
+          #
+          # i.e. no privilege required. With the file ABSENT the kernel falls
+          # back to a restrictive built-in default, and every device open by an
+          # unprivileged process fails with EACCES no matter what the mode bits
+          # say -- `ls -l` shows `crw-rw-rw-` and the open still fails, which
+          # sends you chasing permissions that were never the problem.
+          #
+          # nginx is how this surfaced: its worker setuids to `nginx`, cannot
+          # open /dev/poll, and exits, leaving the master holding the listen
+          # socket so the service looks online and serves nothing.
+          mkdir -p ba/etc/security
+          cp ${gate}/usr/src/uts/intel/os/device_policy ba/etc/security/
+          chmod +w ba/etc/minor_perm
+          # `/dev/poll` needs to be world-openable, and nothing in the gate's
+          # own `minor_perm` says so.
+          #
+          # devpoll creates its node with no mode --
+          # `ddi_create_minor_node(devi, "poll", S_IFCHR, 0, DDI_PSEUDO, 0)`
+          # (uts/common/io/devpoll.c:197) -- which leaves it 0600 root:sys
+          # unless /etc/minor_perm overrides it. On a real illumos system the
+          # entry arrives from driver packaging (`add_drv -m`), not from
+          # uts/intel/os/minor_perm, so copying that file alone does not get it.
+          #
+          # /dev/poll is illumos' scalable readiness interface, the local
+          # equivalent of epoll or kqueue, and a daemon that uses it generally
+          # runs as its own unprivileged user. nginx is the case in hand: its
+          # worker setuids to `nginx` and then dies with
+          #
+          #     [emerg] open(/dev/poll) failed (13: Permission denied)
+          #     [alert] worker process ... exited with fatal code 2 and cannot
+          #             be respawned
+          #
+          # leaving the master alive on the listen socket. SMF still says
+          # `online`, connections to port 80 are still accepted, and every one
+          # of them returns nothing.
+          echo 'poll:poll 0666 root sys' >> ba/etc/minor_perm
           # /etc/netconfig is the transport-selection table libnsl reads via
           # getnetconfig(3NSL): it maps a name like `tcp` onto a semantics, a
           # protocol family and the STREAMS device to push (/dev/tcp). Anything

@@ -162,6 +162,10 @@ in
         lib.optionalString (consoleLogin != null) ''
           co::sysinit:/sbin/console-login
         ''
+        # Activation before svc.startd: init runs sysinit entries in order and
+        # waits for each, so /etc is populated before anything reads it. See
+        # `boot.illumos.activation` in illumos-boot-image.nix.
+        + config.boot.illumos.activation.sysinitLine
         + lib.optionalString config.boot.illumos.smf.enable ''
           smf::sysinit:/lib/svc/bin/svc.startd
         '';

@@ -256,6 +256,31 @@ in
       '';
     };
 
+    activation.enable = mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        Run `system.activationScripts` after init(8) starts and before
+        svc.startd, as an `/etc/inittab` sysinit entry.
+
+        This is what installs `/etc`. Without it the generated tree exists in
+        the store as `''${toplevel}/etc` and nothing ever puts it on the
+        running system, so every consumer has to be handed an absolute store
+        path instead of finding its configuration where it expects to.
+      '';
+    };
+
+    activation.sysinitLine = mkOption {
+      type = types.str;
+      internal = true;
+      description = ''
+        The `/etc/inittab` line that runs activation, or "" when it is off.
+        Read by whichever module writes the inittab -- `illumos-init.nix`
+        normally, `illumos-smf.nix` when SMF replaces the file wholesale --
+        so the two cannot drift apart.
+      '';
+    };
+
     init.preExec = mkOption {
       type = types.nullOr (types.functionTo types.package);
       default = null;
@@ -672,6 +697,66 @@ in
   };
 
   config = mkIf isIllumos {
+    # ------------------------------------------------------------------
+    # Activation: run `system.activationScripts` between init(8) and SMF.
+    #
+    # The other nixbsd platforms have the bootloader exec
+    # `$toplevel/bin/activate-init-native`, which sources `$toplevel/activate`
+    # and then execs init (activate-init.sh; stand-conf-builder.sh on OpenBSD).
+    # That artefact is already built here -- this toplevel has `activate`,
+    # `bin/activate-init` and `bin/activate-init-native` -- but the same
+    # placement does NOT work on this image, and the reason is worth writing
+    # down because it looks like it should.
+    #
+    # Putting activation in front of init means putting it in bootstrap's
+    # handover slot, which makes bootstrap *reference* the toplevel. bootstrap
+    # is copied into the boot archive, so its closure is archive content, and
+    # the archive's own guard rejects the result:
+    #
+    #     ... boehm-gc-...-dev, nix-fetchers-...-dev, libarchive-...-dev
+    #     These are build artifacts and must not be in a ramdisk.
+    #
+    # -- i.e. the whole system closure lands in RAM, undoing `bootArchive.
+    # minimal`. An inittab entry avoids it exactly: `bootArchive.files` COPIES
+    # its files, and a copied file's references are not followed, so the store
+    # path here is text in a data file rather than a dependency edge. It is
+    # resolved at runtime over the store mount, which bootstrap has already
+    # performed by the time init runs. `smf::sysinit:${bootstrap}` in
+    # illumos-smf.nix relies on the same property.
+    #
+    # So it goes after init and before svc.startd -- init runs sysinit entries
+    # in order and waits for each -- which is also the honest description of
+    # where activation belongs on this OS.
+    boot.illumos.activation.sysinitLine = lib.optionalString cfg.activation.enable ''
+      act::sysinit:${
+        pkgs.writeScript "illumos-activate" ''
+          #!${pkgs.bashInteractive}/bin/bash
+          . ${config.system.build.toplevel}/activate
+        ''
+      }
+    '';
+
+    # Two of the stock activation scripts cannot run here, and both are
+    # disabled rather than patched -- they ask for things this platform does
+    # not have, they are not doing them wrongly.
+    #
+    # `cap_mkdb` writes /etc/login.conf and runs cap_mkdb(1) on it. Both are
+    # BSD login-class machinery; illumos has neither and uses /etc/user_attr
+    # and RBAC for that job. Somebody already saw this coming -- the command it
+    # would run is literally `/no-cap_mkdb-on-illumos`, a path chosen to fail
+    # loudly -- and with activation now actually running it would fail loudly
+    # on every boot.
+    #
+    # `users` runs update-users-groups.pl, which needs no useradd and would in
+    # fact work. It is off because it would REWRITE /etc/passwd, /etc/shadow
+    # and /etc/group, and this image writes those three by hand precisely so
+    # root's password field can be empty -- the login path documented in
+    # doc/illumos-ssh.md. Letting the module regenerate them locks the machine
+    # out of itself. Turning it back on means teaching the users module about
+    # this image's accounts; it is not a matter of deleting the line.
+    system.activationScripts.cap_mkdb = lib.mkForce "";
+    system.activationScripts.users = lib.mkForce "";
+
     # main.c's `init-path` boot property defaults to /sbin/init
     # (uts/common/os/main.c:140, zone_initname), and the boot archive is the
     # root filesystem, so the binary has to be in here. See the note on
@@ -1018,13 +1103,15 @@ in
       # libxcrypt will not even generate any more.
       #
       # This literal string, not `users.users.*` / `update-users-groups.pl`,
-      # is the entire source of truth for illumos' `/etc/shadow`. That NixOS
-      # module writes a BSD-style `/etc/master.passwd` from
-      # `system.activationScripts.users`, and nothing on the illumos boot path
-      # ever runs `activationScripts` (illumos boots straight into SMF). So an
-      # option like `users.users.root.initialPassword` is silently a no-op
-      # here -- confirmed by booting and reading a live guest's `/etc/shadow`,
-      # which shows `NP` for root regardless. `illumos-base` used to set it to
+      # is the entire source of truth for illumos' `/etc/shadow`, and it is
+      # kept that way on purpose. `system.activationScripts` DOES run now (see
+      # `boot.illumos.activation` above), but its `users` script is force-
+      # disabled: that NixOS module writes a BSD-style `/etc/master.passwd`
+      # and would regenerate passwd/shadow/group over the three written here,
+      # taking the empty password field with it and locking the machine out of
+      # itself. So `users.users.root.initialPassword` and friends remain
+      # no-ops here -- confirmed by reading a live guest's `/etc/shadow`, which
+      # showed `NP` for root regardless. `illumos-base` used to set it to
       # "toor"; that line was removed rather than left to lie.
       "etc/shadow" = ''
         root::::::::

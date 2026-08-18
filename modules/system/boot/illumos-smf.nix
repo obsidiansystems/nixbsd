@@ -497,6 +497,11 @@ in
       lib.optionalString (pkgs.illumos.console-login or null != null) ''
         co::sysinit:/sbin/console-login
       ''
+      # Activation before the SMF bootstrap, for the same reason `co` comes
+      # before both: init runs sysinit entries in order and waits for each, so
+      # /etc exists before startd or any service reads it. See
+      # `boot.illumos.activation` in illumos-boot-image.nix.
+      + config.boot.illumos.activation.sysinitLine
       + ''
         smf::sysinit:${bootstrap}
       ''

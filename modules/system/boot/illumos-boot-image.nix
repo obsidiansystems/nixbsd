@@ -156,9 +156,9 @@ let
       lib.filter (l: lib.trim l != "") (lib.splitString "\n" cfg.driverAliases)
     )
   );
-  unknownAliasDrivers = lib.filter (e: !(lib.elem (lib.head (lib.splitString " " (lib.trim e))) builtKmods)) (
-    map lib.trim driverAliasEntries
-  );
+  unknownAliasDrivers = lib.filter (
+    e: !(lib.elem (lib.head (lib.splitString " " (lib.trim e))) builtKmods)
+  ) (map lib.trim driverAliasEntries);
   checkedDriverAliases =
     if unknownAliasDrivers == [ ] then
       cfg.driverAliases
@@ -192,6 +192,422 @@ let
     else
       cfg.bootArchive.storePaths;
   closure = pkgs.buildPackages.closureInfo { inherit rootPaths; };
+
+  # ------------------------------------------------------------------
+  # Staging the root tree.
+  #
+  # This builds `ba/`: the whole root filesystem layout -- kernel modules, the
+  # /etc data files, the mount points, the staged store closure, /lib, and the
+  # configured files and symlinks. It is a `let` binding rather than being
+  # written inline in the boot archive builder because there are now two
+  # consumers of the same tree:
+  #
+  #   * `system.build.bootArchive`, which turns it into a UFS or hsfs image for
+  #     the loader to hand to the kernel as a ramdisk, and
+  #   * `system.build.illumosRootTree`, which leaves it a directory for
+  #     virtiofsd to export as the guest's ROOT filesystem
+  #     (`boot.illumos.virtiofsRoot`).
+  #
+  # One tree, two ways of delivering it. Keeping one script is the point: the
+  # /etc tables in here were each added because something failed without them,
+  # and a second, separately written stager would rediscover every one of those
+  # failures.
+  stageRootTree = ''
+    mkdir -p ba/etc
+
+    # krtld resolves unix's DT_NEEDED [genunix] out of here, and
+    # modload() looks the rest up along kobj's module search path
+    # ("/system/boot/kernel /platform/i86pc/kernel /kernel /usr/kernel").
+    # The unix derivation already lays its output out that way -- the
+    # module Makefiles' own $(ROOTMODULE) rules put them there -- so copy
+    # the trees across whole. `usr` matters because a couple of modules
+    # install under $(USR_EXEC_DIR) rather than the root one (shbinexec).
+    # ($out/lib/libgenunix.so is deliberately left out: it is a link-time
+    # stub, not a loadable module. Naming the three trees rather than
+    # copying $out whole is the entire mechanism -- there is no explicit
+    # exclusion anywhere, so `lib` stays out only for as long as this
+    # list does not grow a fourth entry. It is 19MB, measured, which at
+    # ramdisk prices is worth a sentence.)
+    cp -RL --no-preserve=mode ${kernel}/kernel ${kernel}/platform ${kernel}/usr ba/
+
+    # Fold byte-identical modules together.
+    #
+    # A handful of modules are installed under more than one name
+    # because they are more than one kind of thing: `ip` is both a
+    # driver and a STREAMS module, so the gate's Makefiles install the
+    # same object at kernel/drv/amd64/ip *and* kernel/strmod/amd64/ip,
+    # and icmp/udp/tcp go to three places each (drv, strmod, socketmod).
+    #
+    # The `unix` derivation already hard-links these to each other, so
+    # this is not fixing its packaging -- it is undoing what `cp -RL`
+    # does to it. `-L` dereferences, and dereferencing a hard link means
+    # writing the bytes again, so a tree that was compact in the store
+    # arrives here with every alias materialised. Dropping `-L` is not
+    # the fix: it is there so that a symlink in the kernel tree becomes
+    # a real file rather than a link into /nix/store, which the archive
+    # is not allowed to depend on.
+    #
+    # Hard links, not symlinks: kobj resolves modules by walking its
+    # search path and opening the file it finds, so either would work
+    # for the kernel, but a hard link needs no target resolution in the
+    # standalone readers and cannot dangle if a tree is ever moved. Both
+    # image formats preserve them -- UFS natively, hsfs through Rock
+    # Ridge -- which is the same property the staged closure relies on.
+    #
+    # Measured saving: 4.47MB of tree, 5MiB off the finished UFS image
+    # (564133888 against 569376768 bytes). It was ~35MB when this was
+    # written, of which `ip` alone was 32.5MB; the modules have since
+    # been stripped in nixpkgs and `ip` is now 2.7MB, so most of what
+    # this recovered was debug information that no longer exists. The
+    # pass is kept because the *ratio* is what it is -- every alias
+    # doubles, whatever the modules happen to weigh -- and because it
+    # costs one find(1) at build time.
+    find ba/kernel ba/platform ba/usr -type f -links 1 -size +64k -print0 \
+      | xargs -0 sha256sum \
+      | sort \
+      | awk '{ h = $1; sub(/^[0-9a-f]+  /, ""); if (h == ph) print pf "\n" $0; else pf = $0; ph = h }' \
+      | while read -r first && read -r dup; do
+          ln -f "$first" "$dup"
+        done
+
+    # `mach` is in this list for a reason worth writing down, because its
+    # absence costs a day. It names the platform-support modules
+    # psm_modload() will try -- pcplusmp, apix, xpv_psm -- and it is not
+    # optional scaffolding: psm_get_impl_module() on its own only ever
+    # offers DEFAULT_PSM_MODULE, which is `uppc`, and open_mach_list()
+    # (uts/common/os/modsysfile.c) reads this file for everything else.
+    #
+    # So with no /etc/mach the machine silently comes up on uppc: the
+    # plain 8259 fallback, with no I/O APIC. A PCI interrupt then has to
+    # be routed through an ACPI PCI link device, whose _SRS method fails
+    # under qemu, and every PCI driver's attach(9E) unwinds *after* it
+    # has already registered:
+    #
+    #     uppc: WARNING: psm: set_irq: _SRS failed
+    #     mac: NOTICE: vioif0 registered
+    #     mac: NOTICE: vioif0 unregistered
+    #
+    # which leaves the devinfo node bound to its driver but
+    # DI_DRIVER_DETACHED -- from userland indistinguishable from a driver
+    # that was never built at all. The giveaway is that *every* PCI
+    # driver fails identically, which no device-specific explanation
+    # covers. The modules themselves were always here; nothing was ever
+    # offered the chance to probe them.
+    for f in name_to_sysnum minor_perm driver_classes dacf.conf mach; do
+      cp ${gate}/usr/src/uts/intel/os/$f ba/etc/
+    done
+
+    # Every dacf rule's module must be a module that was built. See the
+    # `builtKmods` comment near the top of this file for why this is
+    # worth a build failure. Done here rather than in Nix because the
+    # file's contents come from the gate store path, and reading that at
+    # evaluation time would be import-from-derivation.
+    #
+    # Field 2 of a rule is `<module>:<opset>`; that is the only module
+    # name in the line. `pushmod="usbkbm"` deliberately is NOT checked:
+    # those STREAMS modules are pushed only if the rule ever fires, and
+    # the keyboard/mouse rules here are for hid devices this platform
+    # does not have.
+    dacfBad=$(awk -v mods=" ${lib.concatStringsSep " " builtKmods} " '
+      /^[ \t]*(#|$)/ { next }
+      {
+        split($2, f, ":")
+        if (index(mods, " " f[1] " ") == 0)
+          printf "  line %d: %s\n      -> no module named `%s`\n", FNR, $0, f[1]
+      }' ba/etc/dacf.conf)
+    if [ -n "$dacfBad" ]; then
+      {
+        echo "/etc/dacf.conf names kernel modules which are not in the built module set:"
+        echo "$dacfBad"
+        echo
+        echo "The file is ${gate}/usr/src/uts/intel/os/dacf.conf, staged verbatim."
+        echo "Fix by adding the module to \`kmodNames\` in"
+        echo "pkgs/os-specific/illumos/pkgs/unix.nix (entries look like \"intel/net_dacf\")."
+        echo
+        echo "A dacf rule whose module is absent is a silent no-op: the post-attach"
+        echo "hook never runs, and what you see is a device node that never appears."
+      } >&2
+      exit 1
+    fi
+    # /etc/security/device_policy, from the same uts/intel/os directory.
+    #
+    # illumos enforces a privilege check on device open that is entirely
+    # separate from file permissions, and this file is where the policy
+    # comes from. Its FIRST line is the default:
+    #
+    #     *  read_priv_set=none  write_priv_set=none
+    #
+    # i.e. no privilege required. With the file ABSENT the kernel falls
+    # back to a restrictive built-in default, and every device open by an
+    # unprivileged process fails with EACCES no matter what the mode bits
+    # say -- `ls -l` shows `crw-rw-rw-` and the open still fails, which
+    # sends you chasing permissions that were never the problem.
+    #
+    # nginx is how this surfaced: its worker setuids to `nginx`, cannot
+    # open /dev/poll, and exits, leaving the master holding the listen
+    # socket so the service looks online and serves nothing.
+    mkdir -p ba/etc/security
+    cp ${gate}/usr/src/uts/intel/os/device_policy ba/etc/security/
+    chmod +w ba/etc/minor_perm
+    # `/dev/poll` needs to be world-openable, and nothing in the gate's
+    # own `minor_perm` says so.
+    #
+    # devpoll creates its node with no mode --
+    # `ddi_create_minor_node(devi, "poll", S_IFCHR, 0, DDI_PSEUDO, 0)`
+    # (uts/common/io/devpoll.c:197) -- which leaves it 0600 root:sys
+    # unless /etc/minor_perm overrides it. On a real illumos system the
+    # entry arrives from driver packaging (`add_drv -m`), not from
+    # uts/intel/os/minor_perm, so copying that file alone does not get it.
+    #
+    # /dev/poll is illumos' scalable readiness interface, the local
+    # equivalent of epoll or kqueue, and a daemon that uses it generally
+    # runs as its own unprivileged user. nginx is the case in hand: its
+    # worker setuids to `nginx` and then dies with
+    #
+    #     [emerg] open(/dev/poll) failed (13: Permission denied)
+    #     [alert] worker process ... exited with fatal code 2 and cannot
+    #             be respawned
+    #
+    # leaving the master alive on the listen socket. SMF still says
+    # `online`, connections to port 80 are still accepted, and every one
+    # of them returns nothing.
+    echo 'poll:poll 0666 root sys' >> ba/etc/minor_perm
+    # /etc/netconfig is the transport-selection table libnsl reads via
+    # getnetconfig(3NSL): it maps a name like `tcp` onto a semantics, a
+    # protocol family and the STREAMS device to push (/dev/tcp). Anything
+    # built on TI-RPC consults it, which for us means the NFS mount
+    # helper.
+    #
+    # Its absence does not look like a missing file. mount(8) resolves
+    # `-o proto=tcp` through the NETPATH machinery, finds no netconfig
+    # entries at all, and reports
+    #
+    #     nfs mount: 10.0.2.2: Error in NETPATH.
+    #
+    # which reads like a routing or server problem and is neither -- no
+    # packet is ever sent. Same shape as /etc/mach and /etc/sock2path.d
+    # above: a data file the kernel and libraries assume any real install
+    # has, invisible until the one subsystem that needs it runs.
+    cp ${gate}/usr/src/cmd/netfiles/netconfig ba/etc/netconfig
+
+    # /etc/nfssec.conf is the companion table: it names the RPC security
+    # flavours (`sys`, `dh`, `krb5`, ...) and maps them onto their
+    # pseudo-flavour numbers. The NFS mount helper calls
+    # nfs_getseconfig_default() (cmd/fs.d/nfs/lib/nfs_sec.c) before it
+    # can build the mount arguments, even for plain AUTH_SYS, so with the
+    # file absent it stops at
+    #
+    #     nfs mount: error getting default security entry
+    #
+    # having again sent no packet. This is the file /etc/netconfig
+    # uncovered: fixing one revealed the next.
+    cp ${gate}/usr/src/cmd/fs.d/nfs/etc/nfssec.conf ba/etc/nfssec.conf
+
+    cp ${pkgs.writeText "driver_aliases" checkedDriverAliases} ba/etc/driver_aliases
+    : >ba/etc/system
+    : >ba/etc/mnttab
+    echo '#' >ba/etc/path_to_inst
+
+    mkdir -p ${
+      lib.concatMapStringsSep " " (d: "ba/${lib.escapeShellArg d}") cfg.bootArchive.mountPoints
+    }
+    : >ba/etc/dfs/sharetab
+
+    ${lib.concatStringsSep "\n" (
+      lib.mapAttrsToList (path: text: ''
+        mkdir -p "$(dirname ba/${lib.escapeShellArg path})"
+        cp ${pkgs.writeText "ba-${builtins.baseNameOf path}" text} ba/${lib.escapeShellArg path}
+        chmod u+w ba/${lib.escapeShellArg path}
+      '') cfg.bootArchive.files
+    )}
+
+    # /etc/name_to_major is *not* a source file: uts/intel/os/name_to_major
+    # in the gate holds only the four majors pinned by ABI (md, devinfo,
+    # asy, did). On a real system add_drv(8) appends one line per
+    # installed driver at install time, and there is no add_drv here.
+    #
+    # Without it the very first thing startup_modules() does --
+    # setup_ddi() -> getlongprop_buf() for "rootnex" -- panics with
+    # "Couldn't find major number for 'rootnex'". So synthesise the file:
+    # one entry per driver module actually present in the archive,
+    # numbered from 0 upwards, skipping the pinned majors.
+    reserved=$(awk '!/^#/ && NF == 2 { print $2 }' \
+      ${gate}/usr/src/uts/intel/os/name_to_major)
+    drivers=$(find ba -path '*/kernel/drv/amd64/*' -type f -printf '%f\n' | sort -u)
+
+    cp ${gate}/usr/src/uts/intel/os/name_to_major ba/etc/name_to_major
+    chmod u+w ba/etc/name_to_major
+    major=0
+    for drv in $drivers; do
+      # Skip anything the gate already pins. asy(4D) in particular is
+      # both in the source file (major 106) and in the archive, and a
+      # duplicate entry loses the driver its major -- which quietly costs
+      # the serial console, since consconfig() resolves ttya by
+      # ddi_name_to_major("asy").
+      if awk -v d="$drv" '!/^#/ && $1 == d { found = 1 } END { exit !found }' \
+           ba/etc/name_to_major; then
+        continue
+      fi
+      while echo "$reserved" | grep -qx "$major"; do major=$((major + 1)); done
+      echo "$drv $major" >>ba/etc/name_to_major
+      major=$((major + 1))
+    done
+
+    ${lib.concatStringsSep "\n" (
+      lib.mapAttrsToList (name: path: ''
+        mkdir -p "ba/$(dirname ${lib.escapeShellArg name})"
+        cp -L ${lib.escapeShellArg path} ba/${lib.escapeShellArg name}
+        # exec_common() will not run a file whose mode says it is not
+        # executable, and store files arrive read-only.
+        chmod 755 ba/${lib.escapeShellArg name}
+      '') cfg.bootArchive.extraFiles
+    )}
+
+    # The system closure, at its real store paths: PT_INTERP and
+    # DT_RUNPATH are absolute, so nothing else will do. `cp -a` rather
+    # than `cp -RL`: the image carries symlinks either way -- UFS
+    # natively, hsfs through Rock Ridge -- so a nix profile stays a
+    # symlink farm instead of every link becoming a full copy of its
+    # target. That distinction is the whole reason this is affordable at
+    # all. `cp -a` also keeps hard links within a store path, which both
+    # image formats preserve.
+    # ...minus the build-time-only paths, which is a filter and not a
+    # smaller root set because it cannot be a smaller root set.
+    #
+    # `closureInfo` stages the closure, and a closure is transitive: it
+    # holds everything the reference scanner found, whether or not the
+    # guest will ever open it. On this configuration that is 24.8MB of C
+    # *headers* -- `uts-headers` 23.0MB, `head` 1.3MB, `sys-intel`
+    # 491KB -- more than the entire kernel, loaded into a ramdisk at
+    # boot, for files nothing at runtime reads.
+    #
+    # They arrive through `libc`, which has to be staged (ld.so.1 and
+    # libc.so.1 resolve at their real store paths; PT_INTERP and
+    # DT_RUNPATH are absolute). `libc` is a symlinkJoin, 4KB, over
+    # `libcMinimal` and `rtld`; `rtld`'s own references are exactly
+    # these three header packages, because the store paths survive in
+    # ld.so.1's debug/CTF strings and nix's scanner cannot tell a string
+    # in a debug section from a load-bearing one:
+    #
+    #     $ grep -laF 5mz9gx7...-uts-headers rtld/lib/amd64/*
+    #     rtld/lib/amd64/ld.so.1
+    #
+    # So there is no root set that excludes them while keeping ld.so.1,
+    # and the honest fix is in nixpkgs (scrub those paths out of the
+    # shipped ld.so.1). Until then: stage the closure minus these, and
+    # accept that the archive holds a few dangling references. They are
+    # dangling in the only sense that matters here -- no program opens
+    # them -- and the alternative is paying a kernel's worth of RAM at
+    # every boot for header files.
+    # `-e`, and it is not optional. The default pattern begins with `-`,
+    # so without it grep reads the pattern as a bundle of options,
+    # fails, and -- because this is a pipeline into a file -- leaves
+    # `staged-paths` EMPTY. That produced a 30MB archive with no
+    # userland in it at all, and the build succeeded. Hence the
+    # emptiness check below: a filter that removes everything looks
+    # exactly like a filter that works, right up until the guest has no
+    # libc.
+    grep -v -E -e ${lib.escapeShellArg cfg.bootArchive.excludeStorePaths} \
+      <${closure}/store-paths >staged-paths || true
+
+    excluded=$(( $(wc -l <${closure}/store-paths) - $(wc -l <staged-paths) ))
+    if [ ! -s staged-paths ]; then
+      echo "boot archive: excludeStorePaths matched every path in the" >&2
+      echo "closure. That is never what was meant -- check the pattern:" >&2
+      echo "  ${cfg.bootArchive.excludeStorePaths}" >&2
+      exit 1
+    fi
+    if [ "$excluded" -gt 8 ]; then
+      echo "boot archive: excludeStorePaths dropped $excluded paths." >&2
+      echo "This option is for a handful of known build-time artifacts;" >&2
+      echo "dropping that many means the pattern is too broad, and the" >&2
+      echo "failure would land at boot rather than here." >&2
+      exit 1
+    fi
+
+    # And a build-time guard, because this bloat came back once already
+    # and was found by measuring an ISO months later.
+    #
+    # `disallowedRequisites` is the usual tool and is the wrong one
+    # here: these paths ARE legitimate requisites of `rtld`, so it would
+    # fail the build with no fix available short of patching nixpkgs.
+    # What can be checked is what is actually *staged*, which is this
+    # list, so check that instead: anything whose name says it is a
+    # build-time artifact and that was not explicitly excluded above
+    # fails the build here, at the line that would have copied it.
+    if bad=$(grep -nE '\-(headers|buildtree|dev|src|source|debug)$' staged-paths); then
+      echo "boot archive: build-time-only paths staged:" >&2
+      echo "$bad" >&2
+      echo "" >&2
+      echo "These are build artifacts and must not be in a ramdisk." >&2
+      echo "Either fix the package's runtime references, or -- if it is" >&2
+      echo "genuinely unavoidable, as the header packages below are --" >&2
+      echo "add it to boot.illumos.bootArchive.excludeStorePaths with a" >&2
+      echo "comment saying why." >&2
+      exit 1
+    fi
+
+    echo "boot archive: staging $(wc -l <staged-paths) store paths"
+    echo "boot archive: skipped $excluded by excludeStorePaths:"
+    grep -E -e ${lib.escapeShellArg cfg.bootArchive.excludeStorePaths} \
+      <${closure}/store-paths | sed 's/^/  /' || true
+
+    while read -r p; do
+      mkdir -p "ba$(dirname "$p")"
+      cp -a "$p" "ba$p"
+    done <staged-paths
+    if [ -d ba/nix ]; then chmod -R u+w ba/nix; fi
+
+    # A ranked inventory in the build log, so the next person to ask
+    # "why is this archive so big" can read the answer instead of
+    # rediscovering it. `--apparent-size` throughout: the image itself
+    # is created with truncate(1) and is sparse, and plain `du` on it
+    # reports allocated blocks and understates it by a wide margin.
+    echo "boot archive: what is in it, biggest first"
+    du -sk --apparent-size ba/kernel ba/platform ba/usr 2>/dev/null | sort -rn
+    du -sk --apparent-size $(cat staged-paths | sed 's,^,ba,') 2>/dev/null \
+      | sort -rn | head -20
+
+    # A real illumos root keeps its 64-bit libraries in /lib/amd64, with
+    # /lib/64 as the alias. Two things need this and neither goes through
+    # a runpath: ld.so.1's SONAME is the absolute string
+    # "/lib/amd64/ld.so.1", and libraries like libnsl.so.1 carry no
+    # DT_RUNPATH at all and fall back to the default /lib/64 search path.
+    mkdir -p ba/lib/amd64
+    ln -sfn amd64 ba/lib/64
+    for f in ${pkgs.illumos.libc}/lib/*.so.*; do
+      [ -e "$f" ] || continue
+      ln -sfn "$f" "ba/lib/amd64/$(basename "$f")"
+    done
+    ln -sfn ${pkgs.illumos.libc}/lib/amd64/ld.so.1 ba/lib/amd64/ld.so.1
+
+    # The name service switch backends, for the same reason and by the
+    # same mechanism: libc does not link against them, it `dlopen()`s
+    # "nss_<source>.so.1" by bare name once it has read
+    # /etc/nsswitch.conf. A bare name means the default search path, so a
+    # store path is invisible no matter what is in the closure -- the
+    # library has to appear in /lib/amd64 under exactly that name.
+    #
+    # Without it every `files` lookup fails, and the failures surface
+    # far from here: `ifconfig ... plumb` reports "Insufficient user
+    # authorizations" while running as root, because the uid-to-name
+    # lookup behind chkauthattr() has no backend to answer it.
+    ${lib.optionalString (pkgs.illumos.nss-files or null != null) ''
+      for f in ${pkgs.illumos.nss-files}/lib/nss_*.so.*; do
+        [ -e "$f" ] || continue
+        ln -sfn "$f" "ba/lib/amd64/$(basename "$f")"
+      done
+    ''}
+
+    ${lib.concatStringsSep "\n" (
+      lib.mapAttrsToList (name: target: ''
+        mkdir -p "ba/$(dirname ${lib.escapeShellArg name})"
+        ln -sfn ${lib.escapeShellArg target} ba/${lib.escapeShellArg name}
+      '') cfg.bootArchive.symlinks
+    )}
+
+    chmod -R u+w ba/etc ba/kernel ba/platform
+  '';
 
   # ------------------------------------------------------------------
   # /sbin/init, and what may be interposed in front of userland.
@@ -441,7 +857,25 @@ let
   ) (orderNames config.users.users);
 
   # Guest RAM, in MB. See the note above `system.build.vm`.
-  memMB = config.virtualisation.memorySize or (if cfg.bootArchive.minimal then 2048 else 6144);
+  # Guest memory.
+  #
+  # `bootArchive.minimal` gets 2048 because a small archive is a small ramdisk
+  # -- the archive is a multiboot module, copied into RAM in full before `unix`
+  # is entered, and it sets the floor.
+  #
+  # `virtiofsRoot` does not get to keep that number. The archive is still
+  # loaded, and on top of it the /var and /tmp tmpfs come out of the same
+  # memory, and so does everything the kernel caches from the root -- which is
+  # now every page of every binary the system runs, not just the store.
+  memMB =
+    config.virtualisation.memorySize or (
+      if cfg.virtiofsRoot.enable then
+        4096
+      else if cfg.bootArchive.minimal then
+        2048
+      else
+        6144
+    );
 in
 {
   options.boot.illumos = {
@@ -861,9 +1295,62 @@ in
       '';
     };
 
+    virtiofsRoot.enable = mkOption {
+      type = types.bool;
+      default = false;
+      description = ''
+        Make a virtio-fs share the machine's ROOT filesystem, rather than the
+        boot archive.
+
+        This is a different question from `boot.illumos.rootfs`, and the two
+        were the same option until this existed. `rootfs` says what the boot
+        ARCHIVE is made as -- the ramdisk image the loader hands the kernel --
+        and that is still a real UFS or hsfs filesystem here, still loaded, and
+        still mountable by hand at `/devices/ramdisk:a` if the root mount goes
+        wrong. What changes is only which of the two the kernel mounts on `/`:
+        `kernelArgs` says `fstype=virtiofs`, and `virtiofs_mountroot()` finds
+        the device by the tag in `virtiofsRoot.tag`.
+
+        THE CONSEQUENCE, which is the whole design problem: a virtio-fs export
+        is read-only, so the running system has NO writable filesystem beyond
+        the tmpfs `vfs_mountroot()` puts on /etc/svc/volatile. `bootstrap`
+        answers that by mounting tmpfs on /var and /tmp before it hands over --
+        see `boot.illumos.bootstrap.enable` and modules/illumos/bootstrap.c.
+        A configuration that turns this on without `bootstrap.enable` has
+        nowhere to put /var/run, the SMF repository or a service log.
+
+        Opt-in, and it must stay opt-in. The ramdisk-root configurations are
+        the only way back: a virtio-fs root that fails leaves a machine with no
+        writable storage at all, and the ability to boot the same system the
+        old way is the only thing to debug it from.
+      '';
+    };
+
+    virtiofsRoot.tag = mkOption {
+      type = types.str;
+      default = "rootfs";
+      description = ''
+        The Virtio FS tag the root filesystem is on, passed to the kernel as
+        the `virtiofs-bootfs` boot property.
+
+        A Virtio FS device has no path -- it is found by the tag it advertises
+        in its configuration space, chosen on the host -- so this is what
+        `bootpath` would have been. The kernel defaults it to `store`, which is
+        the tag the userland store mounts use; this defaults to something else
+        on purpose, because the two shares are different things. The root
+        export is a small tree built by `system.build.illumosRootTree`; the
+        `store` share is the host's whole /nix/store, and `bootstrap` mounts
+        it over /nix/store once the root is up.
+      '';
+    };
+
     kernelArgs = mkOption {
       type = types.str;
-      default = "-B console=ttya,input-console=ttya,fstype=${cfg.rootfs}";
+      default =
+        "-B console=ttya,input-console=ttya,fstype="
+        + (
+          if cfg.virtiofsRoot.enable then "virtiofs,virtiofs-bootfs=${cfg.virtiofsRoot.tag}" else cfg.rootfs
+        );
       defaultText = lib.literalExpression ''
         "-B console=ttya,input-console=ttya,fstype=''${config.boot.illumos.rootfs}"
       '';
@@ -980,6 +1467,11 @@ in
       internal = true;
       description = "The iso9660 root filesystem image handed to the kernel as the rootfs module.";
     };
+    illumosRootTree = mkOption {
+      type = types.package;
+      internal = true;
+      description = "The root filesystem as a plain directory, for virtiofsd to export as the guest's root (`boot.illumos.virtiofsRoot`).";
+    };
     illumosImage = mkOption {
       type = types.package;
       internal = true;
@@ -1095,7 +1587,6 @@ in
     system.activationScripts.illumos-coredumps = lib.stringAfter [ "etc" ] ''
       ${pkgs.illumos.coreadm}/bin/coreadm -u
     '';
-
 
     # ------------------------------------------------------------------
     # The accounts a stock illumos expects, with the uids and gids a stock
@@ -1621,6 +2112,44 @@ in
       '';
     };
 
+    # The root filesystem as a directory, for virtiofsd to export.
+    #
+    # Same `stageRootTree` as the boot archive below, and that is the point:
+    # every /etc table in there is there because a boot failed without it, so
+    # the virtio-fs root gets them by construction rather than by somebody
+    # remembering.
+    #
+    # What is added on top is the mount points a read-only root cannot make for
+    # itself. `vfs_mountroot()` does not stop at `/`: it goes on to mount devfs
+    # on /devices, dev on /dev, ctfs on /system/contract, proc on /proc, mntfs
+    # on /etc/mnttab, tmpfs on /etc/svc/volatile, objfs on /system/object,
+    # bootfs on /system/boot and sharefs on /etc/dfs/sharetab (common/fs/vfs.c).
+    # `bootArchive.mountPoints` already names most of those, because hsfs was
+    # read-only too; the rest are here.
+    #
+    # This tree is deliberately NOT the whole system closure. It is the
+    # `bootArchive.minimal` root set -- enough to run `bootstrap` -- and
+    # bootstrap then mounts the host's real /nix/store over /nix/store from the
+    # second Virtio FS device. Exporting a full closure instead would mean a
+    # second complete copy of the system in the host's store, and would still
+    # leave nothing to mount /var with.
+    system.build.illumosRootTree = pkgs.runCommand "illumos-root-tree" { } ''
+      mkdir -p ba/etc
+      ${stageRootTree}
+
+      # mount(2) does not create its target, and this root cannot be written
+      # to at run time, so anything that will ever be mounted on has to be a
+      # directory here.
+      mkdir -p ba/proc ba/system/contract ba/system/object ba/system/boot \
+               ba/etc/dfs ba/etc/svc/volatile ba/dev ba/devices \
+               ba/var ba/tmp ba/mnt ba/nix/store
+      : >ba/etc/mnttab
+      : >ba/etc/dfs/sharetab
+
+      chmod -R u+w ba
+      mv ba $out
+    '';
+
     system.build.bootArchive =
       pkgs.runCommand "illumos-boot-archive"
         {
@@ -1665,402 +2194,7 @@ in
           ) [ pkgs.illumos.uts-base.buildtree ];
         }
         ''
-          mkdir -p ba/etc
-
-          # krtld resolves unix's DT_NEEDED [genunix] out of here, and
-          # modload() looks the rest up along kobj's module search path
-          # ("/system/boot/kernel /platform/i86pc/kernel /kernel /usr/kernel").
-          # The unix derivation already lays its output out that way -- the
-          # module Makefiles' own $(ROOTMODULE) rules put them there -- so copy
-          # the trees across whole. `usr` matters because a couple of modules
-          # install under $(USR_EXEC_DIR) rather than the root one (shbinexec).
-          # ($out/lib/libgenunix.so is deliberately left out: it is a link-time
-          # stub, not a loadable module. Naming the three trees rather than
-          # copying $out whole is the entire mechanism -- there is no explicit
-          # exclusion anywhere, so `lib` stays out only for as long as this
-          # list does not grow a fourth entry. It is 19MB, measured, which at
-          # ramdisk prices is worth a sentence.)
-          cp -RL --no-preserve=mode ${kernel}/kernel ${kernel}/platform ${kernel}/usr ba/
-
-          # Fold byte-identical modules together.
-          #
-          # A handful of modules are installed under more than one name
-          # because they are more than one kind of thing: `ip` is both a
-          # driver and a STREAMS module, so the gate's Makefiles install the
-          # same object at kernel/drv/amd64/ip *and* kernel/strmod/amd64/ip,
-          # and icmp/udp/tcp go to three places each (drv, strmod, socketmod).
-          #
-          # The `unix` derivation already hard-links these to each other, so
-          # this is not fixing its packaging -- it is undoing what `cp -RL`
-          # does to it. `-L` dereferences, and dereferencing a hard link means
-          # writing the bytes again, so a tree that was compact in the store
-          # arrives here with every alias materialised. Dropping `-L` is not
-          # the fix: it is there so that a symlink in the kernel tree becomes
-          # a real file rather than a link into /nix/store, which the archive
-          # is not allowed to depend on.
-          #
-          # Hard links, not symlinks: kobj resolves modules by walking its
-          # search path and opening the file it finds, so either would work
-          # for the kernel, but a hard link needs no target resolution in the
-          # standalone readers and cannot dangle if a tree is ever moved. Both
-          # image formats preserve them -- UFS natively, hsfs through Rock
-          # Ridge -- which is the same property the staged closure relies on.
-          #
-          # Measured saving: 4.47MB of tree, 5MiB off the finished UFS image
-          # (564133888 against 569376768 bytes). It was ~35MB when this was
-          # written, of which `ip` alone was 32.5MB; the modules have since
-          # been stripped in nixpkgs and `ip` is now 2.7MB, so most of what
-          # this recovered was debug information that no longer exists. The
-          # pass is kept because the *ratio* is what it is -- every alias
-          # doubles, whatever the modules happen to weigh -- and because it
-          # costs one find(1) at build time.
-          find ba/kernel ba/platform ba/usr -type f -links 1 -size +64k -print0 \
-            | xargs -0 sha256sum \
-            | sort \
-            | awk '{ h = $1; sub(/^[0-9a-f]+  /, ""); if (h == ph) print pf "\n" $0; else pf = $0; ph = h }' \
-            | while read -r first && read -r dup; do
-                ln -f "$first" "$dup"
-              done
-
-          # `mach` is in this list for a reason worth writing down, because its
-          # absence costs a day. It names the platform-support modules
-          # psm_modload() will try -- pcplusmp, apix, xpv_psm -- and it is not
-          # optional scaffolding: psm_get_impl_module() on its own only ever
-          # offers DEFAULT_PSM_MODULE, which is `uppc`, and open_mach_list()
-          # (uts/common/os/modsysfile.c) reads this file for everything else.
-          #
-          # So with no /etc/mach the machine silently comes up on uppc: the
-          # plain 8259 fallback, with no I/O APIC. A PCI interrupt then has to
-          # be routed through an ACPI PCI link device, whose _SRS method fails
-          # under qemu, and every PCI driver's attach(9E) unwinds *after* it
-          # has already registered:
-          #
-          #     uppc: WARNING: psm: set_irq: _SRS failed
-          #     mac: NOTICE: vioif0 registered
-          #     mac: NOTICE: vioif0 unregistered
-          #
-          # which leaves the devinfo node bound to its driver but
-          # DI_DRIVER_DETACHED -- from userland indistinguishable from a driver
-          # that was never built at all. The giveaway is that *every* PCI
-          # driver fails identically, which no device-specific explanation
-          # covers. The modules themselves were always here; nothing was ever
-          # offered the chance to probe them.
-          for f in name_to_sysnum minor_perm driver_classes dacf.conf mach; do
-            cp ${gate}/usr/src/uts/intel/os/$f ba/etc/
-          done
-
-          # Every dacf rule's module must be a module that was built. See the
-          # `builtKmods` comment near the top of this file for why this is
-          # worth a build failure. Done here rather than in Nix because the
-          # file's contents come from the gate store path, and reading that at
-          # evaluation time would be import-from-derivation.
-          #
-          # Field 2 of a rule is `<module>:<opset>`; that is the only module
-          # name in the line. `pushmod="usbkbm"` deliberately is NOT checked:
-          # those STREAMS modules are pushed only if the rule ever fires, and
-          # the keyboard/mouse rules here are for hid devices this platform
-          # does not have.
-          dacfBad=$(awk -v mods=" ${lib.concatStringsSep " " builtKmods} " '
-            /^[ \t]*(#|$)/ { next }
-            {
-              split($2, f, ":")
-              if (index(mods, " " f[1] " ") == 0)
-                printf "  line %d: %s\n      -> no module named `%s`\n", FNR, $0, f[1]
-            }' ba/etc/dacf.conf)
-          if [ -n "$dacfBad" ]; then
-            {
-              echo "/etc/dacf.conf names kernel modules which are not in the built module set:"
-              echo "$dacfBad"
-              echo
-              echo "The file is ${gate}/usr/src/uts/intel/os/dacf.conf, staged verbatim."
-              echo "Fix by adding the module to \`kmodNames\` in"
-              echo "pkgs/os-specific/illumos/pkgs/unix.nix (entries look like \"intel/net_dacf\")."
-              echo
-              echo "A dacf rule whose module is absent is a silent no-op: the post-attach"
-              echo "hook never runs, and what you see is a device node that never appears."
-            } >&2
-            exit 1
-          fi
-          # /etc/security/device_policy, from the same uts/intel/os directory.
-          #
-          # illumos enforces a privilege check on device open that is entirely
-          # separate from file permissions, and this file is where the policy
-          # comes from. Its FIRST line is the default:
-          #
-          #     *  read_priv_set=none  write_priv_set=none
-          #
-          # i.e. no privilege required. With the file ABSENT the kernel falls
-          # back to a restrictive built-in default, and every device open by an
-          # unprivileged process fails with EACCES no matter what the mode bits
-          # say -- `ls -l` shows `crw-rw-rw-` and the open still fails, which
-          # sends you chasing permissions that were never the problem.
-          #
-          # nginx is how this surfaced: its worker setuids to `nginx`, cannot
-          # open /dev/poll, and exits, leaving the master holding the listen
-          # socket so the service looks online and serves nothing.
-          mkdir -p ba/etc/security
-          cp ${gate}/usr/src/uts/intel/os/device_policy ba/etc/security/
-          chmod +w ba/etc/minor_perm
-          # `/dev/poll` needs to be world-openable, and nothing in the gate's
-          # own `minor_perm` says so.
-          #
-          # devpoll creates its node with no mode --
-          # `ddi_create_minor_node(devi, "poll", S_IFCHR, 0, DDI_PSEUDO, 0)`
-          # (uts/common/io/devpoll.c:197) -- which leaves it 0600 root:sys
-          # unless /etc/minor_perm overrides it. On a real illumos system the
-          # entry arrives from driver packaging (`add_drv -m`), not from
-          # uts/intel/os/minor_perm, so copying that file alone does not get it.
-          #
-          # /dev/poll is illumos' scalable readiness interface, the local
-          # equivalent of epoll or kqueue, and a daemon that uses it generally
-          # runs as its own unprivileged user. nginx is the case in hand: its
-          # worker setuids to `nginx` and then dies with
-          #
-          #     [emerg] open(/dev/poll) failed (13: Permission denied)
-          #     [alert] worker process ... exited with fatal code 2 and cannot
-          #             be respawned
-          #
-          # leaving the master alive on the listen socket. SMF still says
-          # `online`, connections to port 80 are still accepted, and every one
-          # of them returns nothing.
-          echo 'poll:poll 0666 root sys' >> ba/etc/minor_perm
-          # /etc/netconfig is the transport-selection table libnsl reads via
-          # getnetconfig(3NSL): it maps a name like `tcp` onto a semantics, a
-          # protocol family and the STREAMS device to push (/dev/tcp). Anything
-          # built on TI-RPC consults it, which for us means the NFS mount
-          # helper.
-          #
-          # Its absence does not look like a missing file. mount(8) resolves
-          # `-o proto=tcp` through the NETPATH machinery, finds no netconfig
-          # entries at all, and reports
-          #
-          #     nfs mount: 10.0.2.2: Error in NETPATH.
-          #
-          # which reads like a routing or server problem and is neither -- no
-          # packet is ever sent. Same shape as /etc/mach and /etc/sock2path.d
-          # above: a data file the kernel and libraries assume any real install
-          # has, invisible until the one subsystem that needs it runs.
-          cp ${gate}/usr/src/cmd/netfiles/netconfig ba/etc/netconfig
-
-          # /etc/nfssec.conf is the companion table: it names the RPC security
-          # flavours (`sys`, `dh`, `krb5`, ...) and maps them onto their
-          # pseudo-flavour numbers. The NFS mount helper calls
-          # nfs_getseconfig_default() (cmd/fs.d/nfs/lib/nfs_sec.c) before it
-          # can build the mount arguments, even for plain AUTH_SYS, so with the
-          # file absent it stops at
-          #
-          #     nfs mount: error getting default security entry
-          #
-          # having again sent no packet. This is the file /etc/netconfig
-          # uncovered: fixing one revealed the next.
-          cp ${gate}/usr/src/cmd/fs.d/nfs/etc/nfssec.conf ba/etc/nfssec.conf
-
-          cp ${
-            pkgs.writeText "driver_aliases" checkedDriverAliases
-          } ba/etc/driver_aliases
-          : >ba/etc/system
-          : >ba/etc/mnttab
-          echo '#' >ba/etc/path_to_inst
-
-          mkdir -p ${
-            lib.concatMapStringsSep " " (d: "ba/${lib.escapeShellArg d}") cfg.bootArchive.mountPoints
-          }
-          : >ba/etc/dfs/sharetab
-
-          ${lib.concatStringsSep "\n" (
-            lib.mapAttrsToList (path: text: ''
-              mkdir -p "$(dirname ba/${lib.escapeShellArg path})"
-              cp ${pkgs.writeText "ba-${builtins.baseNameOf path}" text} ba/${lib.escapeShellArg path}
-              chmod u+w ba/${lib.escapeShellArg path}
-            '') cfg.bootArchive.files
-          )}
-
-          # /etc/name_to_major is *not* a source file: uts/intel/os/name_to_major
-          # in the gate holds only the four majors pinned by ABI (md, devinfo,
-          # asy, did). On a real system add_drv(8) appends one line per
-          # installed driver at install time, and there is no add_drv here.
-          #
-          # Without it the very first thing startup_modules() does --
-          # setup_ddi() -> getlongprop_buf() for "rootnex" -- panics with
-          # "Couldn't find major number for 'rootnex'". So synthesise the file:
-          # one entry per driver module actually present in the archive,
-          # numbered from 0 upwards, skipping the pinned majors.
-          reserved=$(awk '!/^#/ && NF == 2 { print $2 }' \
-            ${gate}/usr/src/uts/intel/os/name_to_major)
-          drivers=$(find ba -path '*/kernel/drv/amd64/*' -type f -printf '%f\n' | sort -u)
-
-          cp ${gate}/usr/src/uts/intel/os/name_to_major ba/etc/name_to_major
-          chmod u+w ba/etc/name_to_major
-          major=0
-          for drv in $drivers; do
-            # Skip anything the gate already pins. asy(4D) in particular is
-            # both in the source file (major 106) and in the archive, and a
-            # duplicate entry loses the driver its major -- which quietly costs
-            # the serial console, since consconfig() resolves ttya by
-            # ddi_name_to_major("asy").
-            if awk -v d="$drv" '!/^#/ && $1 == d { found = 1 } END { exit !found }' \
-                 ba/etc/name_to_major; then
-              continue
-            fi
-            while echo "$reserved" | grep -qx "$major"; do major=$((major + 1)); done
-            echo "$drv $major" >>ba/etc/name_to_major
-            major=$((major + 1))
-          done
-
-          ${lib.concatStringsSep "\n" (
-            lib.mapAttrsToList (name: path: ''
-              mkdir -p "ba/$(dirname ${lib.escapeShellArg name})"
-              cp -L ${lib.escapeShellArg path} ba/${lib.escapeShellArg name}
-              # exec_common() will not run a file whose mode says it is not
-              # executable, and store files arrive read-only.
-              chmod 755 ba/${lib.escapeShellArg name}
-            '') cfg.bootArchive.extraFiles
-          )}
-
-          # The system closure, at its real store paths: PT_INTERP and
-          # DT_RUNPATH are absolute, so nothing else will do. `cp -a` rather
-          # than `cp -RL`: the image carries symlinks either way -- UFS
-          # natively, hsfs through Rock Ridge -- so a nix profile stays a
-          # symlink farm instead of every link becoming a full copy of its
-          # target. That distinction is the whole reason this is affordable at
-          # all. `cp -a` also keeps hard links within a store path, which both
-          # image formats preserve.
-          # ...minus the build-time-only paths, which is a filter and not a
-          # smaller root set because it cannot be a smaller root set.
-          #
-          # `closureInfo` stages the closure, and a closure is transitive: it
-          # holds everything the reference scanner found, whether or not the
-          # guest will ever open it. On this configuration that is 24.8MB of C
-          # *headers* -- `uts-headers` 23.0MB, `head` 1.3MB, `sys-intel`
-          # 491KB -- more than the entire kernel, loaded into a ramdisk at
-          # boot, for files nothing at runtime reads.
-          #
-          # They arrive through `libc`, which has to be staged (ld.so.1 and
-          # libc.so.1 resolve at their real store paths; PT_INTERP and
-          # DT_RUNPATH are absolute). `libc` is a symlinkJoin, 4KB, over
-          # `libcMinimal` and `rtld`; `rtld`'s own references are exactly
-          # these three header packages, because the store paths survive in
-          # ld.so.1's debug/CTF strings and nix's scanner cannot tell a string
-          # in a debug section from a load-bearing one:
-          #
-          #     $ grep -laF 5mz9gx7...-uts-headers rtld/lib/amd64/*
-          #     rtld/lib/amd64/ld.so.1
-          #
-          # So there is no root set that excludes them while keeping ld.so.1,
-          # and the honest fix is in nixpkgs (scrub those paths out of the
-          # shipped ld.so.1). Until then: stage the closure minus these, and
-          # accept that the archive holds a few dangling references. They are
-          # dangling in the only sense that matters here -- no program opens
-          # them -- and the alternative is paying a kernel's worth of RAM at
-          # every boot for header files.
-          # `-e`, and it is not optional. The default pattern begins with `-`,
-          # so without it grep reads the pattern as a bundle of options,
-          # fails, and -- because this is a pipeline into a file -- leaves
-          # `staged-paths` EMPTY. That produced a 30MB archive with no
-          # userland in it at all, and the build succeeded. Hence the
-          # emptiness check below: a filter that removes everything looks
-          # exactly like a filter that works, right up until the guest has no
-          # libc.
-          grep -v -E -e ${lib.escapeShellArg cfg.bootArchive.excludeStorePaths} \
-            <${closure}/store-paths >staged-paths || true
-
-          excluded=$(( $(wc -l <${closure}/store-paths) - $(wc -l <staged-paths) ))
-          if [ ! -s staged-paths ]; then
-            echo "boot archive: excludeStorePaths matched every path in the" >&2
-            echo "closure. That is never what was meant -- check the pattern:" >&2
-            echo "  ${cfg.bootArchive.excludeStorePaths}" >&2
-            exit 1
-          fi
-          if [ "$excluded" -gt 8 ]; then
-            echo "boot archive: excludeStorePaths dropped $excluded paths." >&2
-            echo "This option is for a handful of known build-time artifacts;" >&2
-            echo "dropping that many means the pattern is too broad, and the" >&2
-            echo "failure would land at boot rather than here." >&2
-            exit 1
-          fi
-
-          # And a build-time guard, because this bloat came back once already
-          # and was found by measuring an ISO months later.
-          #
-          # `disallowedRequisites` is the usual tool and is the wrong one
-          # here: these paths ARE legitimate requisites of `rtld`, so it would
-          # fail the build with no fix available short of patching nixpkgs.
-          # What can be checked is what is actually *staged*, which is this
-          # list, so check that instead: anything whose name says it is a
-          # build-time artifact and that was not explicitly excluded above
-          # fails the build here, at the line that would have copied it.
-          if bad=$(grep -nE '\-(headers|buildtree|dev|src|source|debug)$' staged-paths); then
-            echo "boot archive: build-time-only paths staged:" >&2
-            echo "$bad" >&2
-            echo "" >&2
-            echo "These are build artifacts and must not be in a ramdisk." >&2
-            echo "Either fix the package's runtime references, or -- if it is" >&2
-            echo "genuinely unavoidable, as the header packages below are --" >&2
-            echo "add it to boot.illumos.bootArchive.excludeStorePaths with a" >&2
-            echo "comment saying why." >&2
-            exit 1
-          fi
-
-          echo "boot archive: staging $(wc -l <staged-paths) store paths"
-          echo "boot archive: skipped $excluded by excludeStorePaths:"
-          grep -E -e ${lib.escapeShellArg cfg.bootArchive.excludeStorePaths} \
-            <${closure}/store-paths | sed 's/^/  /' || true
-
-          while read -r p; do
-            mkdir -p "ba$(dirname "$p")"
-            cp -a "$p" "ba$p"
-          done <staged-paths
-          if [ -d ba/nix ]; then chmod -R u+w ba/nix; fi
-
-          # A ranked inventory in the build log, so the next person to ask
-          # "why is this archive so big" can read the answer instead of
-          # rediscovering it. `--apparent-size` throughout: the image itself
-          # is created with truncate(1) and is sparse, and plain `du` on it
-          # reports allocated blocks and understates it by a wide margin.
-          echo "boot archive: what is in it, biggest first"
-          du -sk --apparent-size ba/kernel ba/platform ba/usr 2>/dev/null | sort -rn
-          du -sk --apparent-size $(cat staged-paths | sed 's,^,ba,') 2>/dev/null \
-            | sort -rn | head -20
-
-          # A real illumos root keeps its 64-bit libraries in /lib/amd64, with
-          # /lib/64 as the alias. Two things need this and neither goes through
-          # a runpath: ld.so.1's SONAME is the absolute string
-          # "/lib/amd64/ld.so.1", and libraries like libnsl.so.1 carry no
-          # DT_RUNPATH at all and fall back to the default /lib/64 search path.
-          mkdir -p ba/lib/amd64
-          ln -sfn amd64 ba/lib/64
-          for f in ${pkgs.illumos.libc}/lib/*.so.*; do
-            [ -e "$f" ] || continue
-            ln -sfn "$f" "ba/lib/amd64/$(basename "$f")"
-          done
-          ln -sfn ${pkgs.illumos.libc}/lib/amd64/ld.so.1 ba/lib/amd64/ld.so.1
-
-          # The name service switch backends, for the same reason and by the
-          # same mechanism: libc does not link against them, it `dlopen()`s
-          # "nss_<source>.so.1" by bare name once it has read
-          # /etc/nsswitch.conf. A bare name means the default search path, so a
-          # store path is invisible no matter what is in the closure -- the
-          # library has to appear in /lib/amd64 under exactly that name.
-          #
-          # Without it every `files` lookup fails, and the failures surface
-          # far from here: `ifconfig ... plumb` reports "Insufficient user
-          # authorizations" while running as root, because the uid-to-name
-          # lookup behind chkauthattr() has no backend to answer it.
-          ${lib.optionalString (pkgs.illumos.nss-files or null != null) ''
-            for f in ${pkgs.illumos.nss-files}/lib/nss_*.so.*; do
-              [ -e "$f" ] || continue
-              ln -sfn "$f" "ba/lib/amd64/$(basename "$f")"
-            done
-          ''}
-
-          ${lib.concatStringsSep "\n" (
-            lib.mapAttrsToList (name: target: ''
-              mkdir -p "ba/$(dirname ${lib.escapeShellArg name})"
-              ln -sfn ${lib.escapeShellArg target} ba/${lib.escapeShellArg name}
-            '') cfg.bootArchive.symlinks
-          )}
-
-          chmod -R u+w ba/etc ba/kernel ba/platform
+          ${stageRootTree}
 
           ${
             if cfg.rootfs == "ufs" then
@@ -2332,6 +2466,45 @@ in
         done
         echo "illumos VM: virtiofs tag 'store' -> /nix/store (ro)" >&2
 
+        ${lib.optionalString cfg.virtiofsRoot.enable ''
+          # A SECOND Virtio FS device, holding the guest's ROOT filesystem.
+          #
+          # Two devices rather than one, and the split is not arbitrary. The
+          # root export has to be a full root layout -- /etc, /sbin/init, the
+          # mount points -- and it has to carry, at their REAL store paths,
+          # the handful of things that run before anything else is mounted:
+          # ld.so.1, libc and `bootstrap`. The store export is the host's
+          # whole /nix/store and cannot be given that shape.
+          #
+          # So the kernel mounts the small tree by tag (`virtiofs-bootfs`),
+          # and `bootstrap` -- which is /sbin/init on that tree -- mounts the
+          # big one over /nix/store before handing over to the real init. The
+          # overmount is safe for the same reason it already is with a ramdisk
+          # root: the host store is a superset of what was staged, at the same
+          # paths, and anything already mapped keeps its mapping.
+          #
+          # --readonly here too. `virtiofs_mountroot()` sets VFS_RDONLY and
+          # ROOT_REMOUNT is a no-op, so the guest could not write this even if
+          # the host let it; saying so on both sides keeps the failure honest.
+          ${pkgs.buildPackages.virtiofsd}/bin/virtiofsd \
+            --shared-dir ${config.system.build.illumosRootTree} \
+            --socket-path "$vfsdir/root.sock" \
+            --tag ${lib.escapeShellArg cfg.virtiofsRoot.tag} \
+            --readonly \
+            --sandbox none \
+            --cache metadata \
+            >"$vfsdir/virtiofsd-root.log" 2>&1 &
+          rootvfspid=$!
+          trap 'kill $vfspid $rootvfspid 2>/dev/null; rm -rf "$vfsdir"' EXIT
+
+          for _ in $(seq 1 50); do
+            [ -S "$vfsdir/root.sock" ] && break
+            sleep 0.1
+          done
+          echo "illumos VM: virtiofs tag '${cfg.virtiofsRoot.tag}' -> ${config.system.build.illumosRootTree} (ro, ROOT)" >&2
+        ''}
+
+
         # vhost-user needs the guest's memory to be shareable with the daemon,
         # which plain -m does not give: hence memory-backend-memfd,share=on and
         # a numa node using it. Without this qemu refuses the device outright
@@ -2378,7 +2551,7 @@ in
           -nic user,model=virtio-net-pci,hostfwd=tcp::"$port"-:22 \
           -chardev socket,id=vfs0,path="$vfsdir/vfs.sock" \
           -device vhost-user-fs-pci,chardev=vfs0,tag=store \
-          ${
+          ${lib.optionalString cfg.virtiofsRoot.enable "-chardev socket,id=vfsroot,path=\"$vfsdir/root.sock\" \\\n          -device vhost-user-fs-pci,chardev=vfsroot,tag=${cfg.virtiofsRoot.tag} \\\n          "}${
             if cfg.directKernelBoot then
               ''
                 -kernel ${kernel}/platform/i86pc/kernel/amd64/unix \

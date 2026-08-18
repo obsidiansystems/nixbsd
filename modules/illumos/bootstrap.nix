@@ -125,6 +125,7 @@ in
       pkgs.illumos.callPackage ./bootstrap-package.nix {
         inherit next network;
         storeDir = cfg.bootstrap.storeMountPoint;
+        rootVirtiofs = cfg.virtiofsRoot.enable;
       };
 
     # The two /etc entries devfsadm needs, which have to be baked into the

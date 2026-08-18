@@ -52,6 +52,16 @@
   # meant to be reached over the virtio-fs store), so compiling them in would
   # cost the archive their closures in exchange for nothing.
   network ? null,
+
+  # Root on virtio-fs.
+  #
+  # Changes two steps: there is no read-write remount to do (the export is
+  # read-only and virtiofs_mountroot() makes ROOT_REMOUNT a no-op), and /var
+  # and /tmp have to become tmpfs, because otherwise the machine has no
+  # writable filesystem at all. See `boot.illumos.virtiofsRoot` in
+  # modules/system/boot/illumos-boot-image.nix and the ROOT_VIRTIOFS blocks in
+  # ./bootstrap.c.
+  rootVirtiofs ? false,
 }:
 
 # bootstrap(1) -- the boot sequence, as a program rather than a shell script.
@@ -141,6 +151,7 @@ mkDerivation {
         -DSOCONFIG_DIR='"${soconfig}/etc/sock2path.d"' \
         -DSTORE_DIR='"${storeDir}"' \
         -DSTORE_PARENT='"${dirOf storeDir}"' \
+        ${lib.optionalString rootVirtiofs "-DROOT_VIRTIOFS=1"} \
         ${
           lib.optionalString (next != null) ''
             -DNEXT_PROG='"${next.path}"' \

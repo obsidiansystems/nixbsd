@@ -51,6 +51,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -130,6 +131,44 @@
  *                          EEXIST. They are named anyway because "almost" is
  *                          not a property to bet a boot on.
  */
+#ifdef	ROOT_VIRTIOFS
+/*
+ * With a virtio-fs root there is no writable filesystem on the machine at all
+ * except the tmpfs vfs_mountroot() puts on /etc/svc/volatile -- the host
+ * exports the share read-only, virtiofs_mountroot() sets VFS_RDONLY, and
+ * ROOT_REMOUNT is a deliberate no-op.  So the list above cannot be used as it
+ * stands: every entry under /etc or /var would be EROFS, and the ones that
+ * matter would be missing rather than merely noisy.
+ *
+ * What replaces it is: mount tmpfs on /var and /tmp first (see mount_tmpfs()),
+ * then make the directories INSIDE those.  /etc entries are not here at all --
+ * anything under /etc that has to be writable is a symlink into
+ * /etc/svc/volatile, staged into the exported root tree the same way /etc/dev
+ * already is for devfsadm.
+ *
+ * /nix and /nix/store are NOT here, and their absence is the same reasoning
+ * inverted.  mount(2) does not create its target, so on a ramdisk root they
+ * are named defensively; on this one they cannot be created at all -- /nix is
+ * on the read-only export -- so naming them buys two guaranteed EROFS
+ * failures on every boot and no protection whatsoever.  The exported root
+ * tree carries them instead (`system.build.illumosRootTree`), which is where
+ * a mount point on a read-only root has to come from.
+ */
+static const char *const dirs[] = {
+	"/etc/svc/volatile/dev",
+	"/etc/svc/volatile/dladm",
+	"/var/run",
+	"/var/empty",
+	"/var/adm",
+	"/var/tmp",
+	"/var/log",
+	"/var/svc",
+	"/var/svc/log",
+	"/var/svc/manifest",
+	"/var/svc/profile",
+	NULL
+};
+#else
 static const char *const dirs[] = {
 	"/etc",
 	"/etc/svc",
@@ -143,6 +182,7 @@ static const char *const dirs[] = {
 	STORE_DIR,
 	NULL
 };
+#endif	/* ROOT_VIRTIOFS */
 
 static int failures = 0;
 
@@ -235,6 +275,59 @@ step_failed(const char *what, int err)
 	say("bootstrap: FAILED: %s: %s\n", what, strerror(err));
 }
 
+#ifdef	ROOT_VIRTIOFS
+/*
+ * Mount a tmpfs.
+ *
+ * This is the whole answer to "where does writable state live" on a machine
+ * whose root is a read-only virtio-fs share.  The SMF repository, /var/run,
+ * /var/adm/utmpx, sshd's host keys, every service log and /tmp all need a
+ * filesystem that can be written, and with the root on the host's export
+ * there is exactly one such filesystem in the kernel already -- the tmpfs
+ * vfs_mountroot() puts on /etc/svc/volatile -- and it is the wrong shape and
+ * the wrong place for most of that.
+ *
+ * tmpfs rather than the ramdisk, and the ramdisk really is the alternative:
+ * the boot archive is still loaded (it is still a multiboot module, it is
+ * still `boot.illumos.rootfs`) and /devices/ramdisk:a is still a mountable
+ * UFS filesystem sitting in memory.  Two reasons not to use it.  It is a
+ * FIXED size, chosen at build time from the size of the staged tree, and
+ * `boot.illumos.rootfsHeadroom` exists because guessing that size wrong is
+ * how `illumos-full-virtiofs` met "NOTICE: alloc: /: file system full"
+ * seconds into svc.startd's manifest import.  And it is the image the system
+ * would have booted from, so writing to it destroys the one artifact worth
+ * comparing against when the virtio-fs root misbehaves.  tmpfs grows on
+ * demand out of the same memory and costs nothing when unused.
+ *
+ * The special is "swap", which is what tmpfs is conventionally given and what
+ * mnttab will show; tmpfs itself ignores it.  MS_OPTIONSTR for the same
+ * in/out-buffer reason as every other mount in this file -- the kernel writes
+ * the canonical option string back, so the buffer must be writable and
+ * MAX_MNTOPT_STR long or the call returns EOVERFLOW having done nothing.
+ *
+ * No size= option deliberately: tmpfs then bounds itself by available
+ * memory, which on a VM with no swap is the honest limit.  Naming a number
+ * here would reintroduce exactly the fixed-ceiling problem that the ramdisk
+ * has.
+ */
+static void
+mount_tmpfs(const char *dir)
+{
+	char optbuf[MAX_MNTOPT_STR];
+
+	optbuf[0] = '\0';
+
+	if (mount("swap", dir, MS_OPTIONSTR, "tmpfs", NULL, 0, optbuf,
+	    sizeof (optbuf)) != 0) {
+		step_failed("mount tmpfs on", errno);
+		say("bootstrap:   (%s: nothing below can write there)\n", dir);
+		return;
+	}
+
+	say("bootstrap: mounted tmpfs on %s [%s]\n", dir, optbuf);
+}
+#endif	/* ROOT_VIRTIOFS */
+
 /*
  * Remount / read-write.
  *
@@ -287,8 +380,175 @@ remount_root_rw(void)
 	say("bootstrap: / remounted read-write [%s]\n", optbuf);
 }
 
+#ifdef	ROOT_VIRTIOFS
 /*
- * mkdir -p, minus the -p. The list above is fully expanded -- every parent is
+ * Give /dev a writable attribute store.
+ *
+ * This is the second half of the writability problem, and the half that is not
+ * obvious. /dev is a `dev` filesystem, mounted by vfs_mountroot() long before
+ * this program runs, so it looks like it should be writable whatever the root
+ * is. It is not. sdev keeps the persistent half of every node -- the symlinks
+ * devfsadm creates, and the modes and owners minor_perm asks for -- in a
+ * BACKING DIRECTORY in the underlying filesystem, and sdev_mount() defaults
+ * that directory to the mount point itself (`avp = mvp`, sdev_vfsops.c:260).
+ * With the root on a read-only virtio-fs share the mount point is on that
+ * share, so every link devfsadm tries to make fails:
+ *
+ *     devfsadm: symlink failed for /dev/tcp -> ../devices/pseudo/udp@0:tcp:
+ *         Read-only file system
+ *     devfsadm: devlink cache does not exist
+ *
+ * and the damage is not confined to /dev. soconfig(8) then cannot open
+ * /dev/ticotsord, /dev/ticlts or /dev/udp, so the socket-to-transport
+ * mappings never load, so socket(AF_INET, ...) fails at CREATION -- and every
+ * networking symptom downstream points at a driver that is working fine.
+ *
+ * sdev has a mount option for exactly this: `sdev_attrdir`, a path to use as
+ * the attribute store instead of the mount point (sdev_vfsops.c:242). Nothing
+ * in userland passes it -- there is no /usr/lib/fs/dev/mount -- so this is
+ * mount(2) with the private argument struct, which is one uint64_t holding a
+ * pointer to the path. Declared here rather than included: <sys/fs/sdev_impl.h>
+ * is a kernel-private header that is not shipped in the headers package, and
+ * the struct is a single field pinned by the copyin's `datalen != sizeof`
+ * check (sdev_subr.c:2268).
+ *
+ * MS_REMOUNT because /dev is already mounted, and the remount path is what
+ * swaps the attribute vnode (sdev_vfsops.c:303-304) after marking the existing
+ * nodes stale. devfsadm runs immediately after this and rebuilds them.
+ *
+ * The store goes on /etc/svc/volatile, the tmpfs vfs_mountroot() mounts before
+ * any of this -- NOT on the /var tmpfs above, deliberately. /dev has to work
+ * even if the /var mount failed, because a machine with no /dev/console has no
+ * way to say that it did.
+ */
+struct bootstrap_sdev_mountargs {
+	uint64_t sdev_attrdir;
+};
+
+#define	DEV_ATTRDIR	"/etc/svc/volatile/dev-attr"
+
+static void
+dev_attrdir(void)
+{
+	struct bootstrap_sdev_mountargs args;
+	static char path[] = DEV_ATTRDIR;
+	char optbuf[MAX_MNTOPT_STR];
+
+	if (mkdir(DEV_ATTRDIR, 0755) != 0 && errno != EEXIST) {
+		step_failed("mkdir " DEV_ATTRDIR, errno);
+		return;
+	}
+
+	/*
+	 * THE RELATIVE-SYMLINK TRAP, found the hard way and worth describing,
+	 * because the symptom is a file that is visibly there and cannot be
+	 * opened:
+	 *
+	 *     illumos# ls -l /dev/null
+	 *     lrwxrwxrwx 1 root root 27 /dev/null -> ../devices/pseudo/mm@0:null
+	 *     illumos# cat /devices/pseudo/mm@0:null
+	 *     illumos# cat /dev/null
+	 *     cat: /dev/null: No such file or directory
+	 *
+	 * Every /dev entry devfsadm makes is a RELATIVE symlink -- /dev/null is
+	 * "../devices/pseudo/mm@0:null", /dev/sad/user is
+	 * "../../devices/pseudo/sad@0:user" -- so all of them depend on ".."
+	 * from /dev leading to "/".  After the remount above it does not:
+	 *
+	 *     illumos# ls -a /dev/..
+	 *     allkmem  arp  conslog  console  cua  cua0  ...
+	 *
+	 * that is the content of /dev itself.  sdev's root is its own
+	 * sdev_dotdot (sdev_vfsops.c:286), and crossing a VROOT on ".." is the
+	 * VFS layer's job, done through vfs_vnodecovered -- which after this
+	 * remount points at the previous /dev rather than at the directory
+	 * underneath it.  It is not clear that a mount(2) can arrange
+	 * otherwise: there is no unmount-and-remount available, because
+	 * everything holding /dev open at this moment is this process.
+	 *
+	 * So make ".." right instead of fighting it.  With ".." meaning /dev,
+	 * "../devices" means /dev/devices, and one symlink in the attribute
+	 * store puts it there.  The same link serves the subdirectories:
+	 * "../../devices" from /dev/sad walks to /dev twice and lands in the
+	 * same place.
+	 *
+	 * It costs one visible entry, /dev/devices, which is a real cost and
+	 * is written down here rather than hidden.  What it buys is
+	 * /dev/null -- and svc.startd exits outright without that, taking SMF
+	 * and the whole system with it.
+	 */
+	if (symlink("/devices", DEV_ATTRDIR "/devices") != 0 &&
+	    errno != EEXIST)
+		step_failed("symlink " DEV_ATTRDIR "/devices", errno);
+
+	args.sdev_attrdir = (uint64_t)(uintptr_t)path;
+	optbuf[0] = '\0';
+
+	if (mount("/dev", "/dev", MS_REMOUNT | MS_DATA | MS_OPTIONSTR, "dev",
+	    (char *)&args, sizeof (args), optbuf, sizeof (optbuf)) != 0) {
+		step_failed("remount /dev with an attribute store", errno);
+		say("bootstrap:   (devfsadm will create nothing: /dev's "
+		    "backing store is the read-only root)\n");
+		return;
+	}
+
+	say("bootstrap: /dev attribute store on %s [%s]\n", DEV_ATTRDIR,
+	    optbuf);
+}
+
+/*
+ * Make the freshly-repopulated /dev resolvable by name.
+ *
+ * The remount above calls sdev_stale() on every node under the /dev root
+ * (sdev_vfsops.c:290), which is correct -- the old nodes were attributed
+ * against the read-only root -- but it means that immediately afterwards a
+ * plain open("/dev/null") can fail ENOENT even though devfsadm has just
+ * created the link and a readdir of /dev shows it. Reading the directory is
+ * what walks the stale list and revalidates it.
+ *
+ * This is not a cosmetic race. /dev/null in particular is opened by the very
+ * next thing to run: smf-bootstrap redirects to it, and svc.startd exits
+ * outright --
+ *
+ *     svc.startd: can't connect stdin to /dev/null: No such file or directory
+ *
+ * -- taking SMF, and therefore the whole system, with it. So sweep the
+ * directory here, where the cost is one readdir and the failure is still
+ * attributable, rather than leaving it to whichever consumer happens to be
+ * first.
+ *
+ * The open() at the end is a check, not a fix: it names the one node whose
+ * absence is fatal, so that if this ever stops being sufficient the log says
+ * so at the point of the sweep instead of three programs later.
+ */
+static void
+settle_dev(void)
+{
+	DIR *d;
+	int n = 0, fd;
+
+	if ((d = opendir("/dev")) == NULL) {
+		step_failed("opendir /dev", errno);
+		return;
+	}
+	while (readdir(d) != NULL)
+		n++;
+	(void) closedir(d);
+
+	if ((fd = open("/dev/null", O_RDWR)) < 0) {
+		step_failed("open /dev/null after devfsadm", errno);
+		say("bootstrap:   (svc.startd will not start without it)\n");
+		return;
+	}
+	(void) close(fd);
+
+	say("bootstrap: /dev settled, %d entries, /dev/null opens\n", n);
+}
+#endif	/* ROOT_VIRTIOFS */
+
+/*
+ * mkdir -p, minus the -p.
+ The list above is fully expanded -- every parent is
  * named -- so this is a plain mkdir(2) per entry with EEXIST accepted.
  *
  * Written this way rather than as a path-splitting mkdirp() because of the
@@ -500,8 +760,21 @@ main(int argc, char **argv)
 
 	say("bootstrap: starting\n");
 
-	/* 1. The read-write root. Everything below needs it. */
+	/*
+	 * 1. Somewhere to write.
+	 *
+	 * With a ramdisk root that is the root itself, which the kernel
+	 * mounted read-only for ROOT_INIT; with a virtio-fs root there is no
+	 * making it writable at all, so /var and /tmp become tmpfs instead.
+	 * Either way nothing below this line can write until it has run.
+	 */
+#ifdef	ROOT_VIRTIOFS
+	mount_tmpfs("/var");
+	mount_tmpfs("/tmp");
+	dev_attrdir();
+#else
 	remount_root_rw();
+#endif
 
 	/* 2. The directories the steps below write into. */
 	make_dirs();
@@ -561,6 +834,9 @@ main(int argc, char **argv)
 
 		(void) run("devfsadm -P", DEVFSADM, pav, environ);
 		(void) run("devfsadm", DEVFSADM, av, environ);
+#ifdef	ROOT_VIRTIOFS
+		settle_dev();
+#endif
 	}
 
 	/*

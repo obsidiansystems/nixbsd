@@ -60,19 +60,20 @@ let
 
   # <dependency>/<dependent> -------------------------------------------------
 
-  # A `<dependency>` holding more than one `<service_fmri>` kills svc.configd
-  # during `svccfg import`. The import dies with
+  # Historical note: a `<dependency>` holding more than one `<service_fmri>`
+  # used to kill svc.configd during `svccfg import`. The import died with
   #
   #     svccfg: Could not delete svc:/TEMP/<service> (repository connection broken).
   #
-  # which is ECONNABORTED from the door call: configd took SIGSEGV, so its own
-  # error paths never ran. The repository is left incomplete and svc.startd
-  # then puts everything into maintenance.
+  # which is ECONNABORTED from the door call: configd had taken SIGSEGV, so its
+  # own error paths never ran. The repository was left incomplete and svc.startd
+  # then put everything into maintenance. That message is the only trace the
+  # failure leaves behind, so it is recorded here for whoever greps for it.
   #
   # The cause, read out of configd's core -- it writes one as
   # `core.svc.configd.<time>.<pid>` in its own cwd, via
   # `core_set_process_path` at cmd/svc/configd/configd.c:659, which as root is
-  # `/`. The faulting thread is
+  # `/`. The faulting thread was
   #
   #     client_switcher -> tx_commit -> rc_tx_commit -> object_tx_commit
   #       -> tx_process_cmds -> backend_tx_run_update
@@ -89,47 +90,35 @@ let
   # (common/svc/repcache_protocol.h:765), and `P2ROUNDUP(x, align)` is
   # `(-(-(x) & -(align)))` (uts/common/sys/sysmacros.h:268). With `x` a
   # `uint32_t` and `align` a `size_t`, `-(x)` is evaluated in 32 bits and then
-  # *zero*-extended to 64 before the mask, so the closing negation lands in
-  # the top half: `TX_SIZE((uint32_t)27)` is 0xffffffff0000001c, not 28. Every
+  # *zero*-extended to 64 before the mask, so the closing negation landed in
+  # the top half: `TX_SIZE((uint32_t)27)` was 0xffffffff0000001c, not 28. Every
   # other TX_SIZE call site assigns the result back to a 32-bit variable and
-  # so truncates the damage away; this one feeds it straight into pointer
-  # arithmetic. It is reached only from the second iteration of the value loop
-  # onwards, which is exactly why one `<service_fmri>` is fine and two are
-  # fatal.
+  # so truncated the damage away; this one fed it straight into pointer
+  # arithmetic. It was reached only from the second iteration of the value
+  # loop onwards, which is exactly why one `<service_fmri>` was fine and two
+  # were fatal.
   #
-  # It is 64-bit-only -- with a 32-bit `size_t` both halves agree -- which is
-  # why upstream, where cmd/svc/configd is still built 32-bit, has never hit
-  # it. The fix (cast the operand to `size_t`) belongs in illumos-gate, not
-  # here.
+  # It was 64-bit-only -- with a 32-bit `size_t` both halves agree -- which is
+  # why upstream, where cmd/svc/configd is still built 32-bit, never hit it.
   #
-  # Until then, emit one block per FMRI. For the "all" groupings that is the
-  # same thing: requiring A and B in one block is requiring A in one block and
-  # B in another.
-  #
-  # It is *not* the same for `require_any` ("any one of these") or `exclude_all`,
-  # so those are left alone and will still hit the bug -- better than silently
-  # turning "any" into "all". Nothing generates them today.
-  splittableGrouping = g: g == "require_all" || g == "optional_all";
+  # It is fixed in our illumos tree: patches 0068 and 0069 under
+  # pkgs/os-specific/illumos/patches/ cast the operand to `size_t` at both
+  # affected call sites. This module therefore no longer splits a dependency
+  # into one block per FMRI. That workaround could not represent `require_any`
+  # or `exclude_all` at all -- you cannot split "any one of these" into
+  # separate dependencies without changing its meaning -- and both groupings
+  # are usable again.
 
   fmriNodes = fmris: map (f: leaf "service_fmri" { value = f; }) fmris;
 
-  # Returns a *list* of nodes, since one dependency may split into several.
-  dependencyNodes =
+  dependencyNode =
     name: d:
-    let
-      block =
-        suffix: fmris:
-        elem "dependency" {
-          name = name + suffix;
-          inherit (d) grouping;
-          restart_on = d.restartOn;
-          inherit (d) type;
-        } (fmriNodes fmris);
-    in
-    if splittableGrouping d.grouping && length d.fmris > 1 then
-      imap0 (i: f: block "-${toString i}" [ f ]) d.fmris
-    else
-      [ (block "" d.fmris) ];
+    elem "dependency" {
+      inherit name;
+      inherit (d) grouping;
+      restart_on = d.restartOn;
+      inherit (d) type;
+    } (fmriNodes d.fmris);
 
   dependentNode =
     name: d:
@@ -212,7 +201,7 @@ let
   # sequences, not choices, so a manifest whose elements are correct but
   # misordered is rejected outright.
   commonChildren = x:
-    concatLists (mapAttrsToList dependencyNodes x.dependencies)
+    mapAttrsToList dependencyNode x.dependencies
     ++ mapAttrsToList dependentNode x.dependents
     ++ methodContextNodes x.methodContext
     ++ mapAttrsToList execMethodNode x.execMethods

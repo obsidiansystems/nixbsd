@@ -92,6 +92,30 @@ let
 
   manifestDir = config.system.build.smfManifests or null;
 
+  # What lands at /lib/svc/manifest: the manifests nixbsd generates, plus the
+  # stock `restarter.xml` that svc.startd ships.
+  #
+  # `svc:/system/svc/restarter:default` represents the master restarter.
+  # startd creates it implicitly on a writable root, but on a read-only one it
+  # never appears, and `svcadm disable -s` / `enable -s` then fail with
+  # `Restarter for instance "..." is unavailable`. Importing the manifest makes
+  # it exist on both, rather than depending on which filesystem the root is.
+  #
+  # This could not be done until the second TX_SIZE defect was fixed
+  # (configd crashed importing any property with two or more values, which
+  # restarter.xml has); see illumos-gate `up/configd-tx-size`.
+  allManifests =
+    if manifestDir == null || startd == null then
+      manifestDir
+    else
+      pkgs.buildPackages.symlinkJoin {
+        name = "smf-manifests-with-restarter";
+        paths = [
+          manifestDir
+          "${startd}/lib/svc/manifest"
+        ];
+      };
+
   shell = "${pkgs.bash}/bin/bash";
 
   # startd exec's CONFIGD_PATH with an empty argv (fork.c:485), so the only
@@ -693,7 +717,7 @@ in
       "lib/svc/bin/svc.configd" = lib.mkForce "${configdWrapper}";
 
       # svccfg imports from here, and manifest-import would too.
-      "lib/svc/manifest" = "${manifestDir}";
+      "lib/svc/manifest" = "${allManifests}";
 
       # log_init() prefers /var/svc/log and falls back to /etc/svc/volatile
       # (cmd/svc/startd/log.c:671); give it the real path, pointed at the one

@@ -4,25 +4,16 @@ Although theoretically much of this work could be copied to build other BSDs,
 all work thus far has been focused on building a FreeBSD distribution.
 
 ## Structure
-As of January 2023, NixBSD consists of 3 main repositories:
+NixBSD has three main components
 
-### [nix](https://github.com/rhelmot/nix)
-A fork of upstream nix with changes to allow building on FreeBSD and for FreeBSD platforms.
-The changes are fairly minor and mostly around fixing bugs in the existing FreeBSD port.
+### Nix
+Native FreeBSD Nix support is already upstream, and a fork is no longer necessary as of 2026.
 
-It is likely that these can be upstreamed fairly quickly with some cleanup.
+### [Nixpkgs](https://github.com/rhelmot/nixpkgs/tree/freebsd-staging)
+Most of the necessary Nixpkgs changes have already merged into upstream,
+but a few changes are often needed during development of features.
 
-### [nixpkgs](https://github.com/rhelmot/nixpkgs/tree/freebsd-staging)
-A fork of upstream nixpkgs with support for the FreeBSD platform and a variety of FreeBSD packages.
-
-This adds a few new supported systems, including `x86_64-freebsd`, the host system
-we have been using for most development. It's based off staging and has some changes to
-the stdenv that also affects stdenv, so you have to rebuild everything from bootstrap.
-
-This will require a fair amount of work to clean up to an upstreamable state,
-but it should not require massive reorganization
-
-### [NixBSD](https://github.com/nixos-bsd/nixbsd)
+### [NixBSD](https://github.com/nix-community/nixbsd)
 This repository contains modules for building a system, like the `nixos` directory in nixpkgs.
 When possible, modules are taken directly from nixpkgs without copying
 (see references to `extPath` in [module-list](modules/module-list.nix).

@@ -70,6 +70,7 @@ in
   ./services/networking/dhcpcd.nix
   ./services/networking/ssh/sshd.nix
   ./services/system/nix-daemon.nix
+  ./services/system/cloud-init.nix
   ./services/web-servers/nginx/default.nix
   ./services/databases/postgresql.nix
   ./services/databases/redis.nix

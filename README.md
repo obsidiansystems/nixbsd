@@ -57,6 +57,22 @@ Note, however, that trusted substituters can maliciously modify outputs, so only
 * Some package checks may fail intermittently under heavy load. If that happens you may want to build with `--max-jobs 4` or lower so fewer packages are competing for the CPU at the same time.
 * To see what is happening, you might want to use [nix-output-monitor](https://github.com/maralorn/nix-output-monitor). For flake commands you can replace `nix` with `nom` to use it.
 
+### Amazon Machine Images
+Importing [`modules/virtualisation/amazon-image.nix`](modules/virtualisation/amazon-image.nix)
+(see the [`amazon`](configurations/amazon) configuration) gives you a system that
+boots on EC2 with UEFI, the ENA network driver, and a serial console. Amazon's
+metadata service is consumed by [cloud-init](https://cloud-init.io/), which puts
+the SSH key chosen at launch on `root`, grows the root filesystem to the EBS
+volume, and runs any user-data scripts.
+
+```shell
+# Raw GPT disk image with the ESP and a UFS root
+nix build .#amazon.amazonImage
+# Upload to S3, import as an EBS snapshot, and register a UEFI AMI.
+# The account needs the `vmimport` service role.
+nix run .#amazon.uploadAmazonImage -- --bucket my-bucket --region us-east-1
+```
+
 ## Contributing
 We'd be happy to review any pull requests! If you have any problems please open an issue on this repo, we're using this issue tracker for nix and nixpkgs issues as well.
 

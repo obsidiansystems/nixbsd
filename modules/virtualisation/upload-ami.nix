@@ -75,7 +75,7 @@ writeShellApplication {
         echo "s3://$bucket/$key already uploaded" >&2
       else
         echo "uploading $imageFile to s3://$bucket/$key" >&2
-        aws s3 cp --no-progress "$imageFile" "s3://$bucket/$key"
+        aws s3 cp "$imageFile" "s3://$bucket/$key"
       fi
 
       echo "importing snapshot" >&2

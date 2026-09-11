@@ -57,7 +57,7 @@ let
     ];
     format = "raw";
     partitionTableType = "efi";
-    totalSize = "${toString cfg.sizeMB}m";
+    totalSize = if cfg.sizeMB == null then null else "${toString cfg.sizeMB}m";
   };
 
   uploadAmazonImage = pkgs.buildPackages.callPackage ./upload-ami.nix {
@@ -81,12 +81,13 @@ in
     };
 
     sizeMB = lib.mkOption {
-      type = lib.types.ints.positive;
-      default = 4096;
+      type = lib.types.nullOr lib.types.ints.positive;
+      default = null;
       description = ''
-        Size of the disk image in megabytes. The root filesystem is grown to
-        fill the EBS volume on first boot, so this only needs to fit the
-        closure.
+        Size of the disk image in megabytes, or null to make it exactly as
+        large as its partitions. The root filesystem is grown to fill the EBS
+        volume on first boot, so padding the image only makes the upload
+        bigger.
       '';
     };
   };

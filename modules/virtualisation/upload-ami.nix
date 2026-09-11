@@ -1,5 +1,9 @@
-# Script that uploads a raw disk image to S3, imports it as an EBS snapshot,
-# and registers a UEFI, ENA-enabled AMI from it. Runs on the build machine.
+# Script that uploads a disk image to S3, imports it as an EBS snapshot, and
+# registers a UEFI, ENA-enabled AMI from it. Runs on the build machine.
+#
+# The raw image is converted to a stream-optimized VMDK first: VM Import
+# won't take a compressed raw file, but that VMDK subformat is deflated
+# internally, so a mostly-empty image uploads as a fraction of its size.
 #
 # Every stage is skipped if its result already exists, so re-running is safe:
 # an AMI with the target name is returned as is, a finished snapshot whose
@@ -13,6 +17,7 @@
   writeShellApplication,
   awscli2,
   jq,
+  qemu-utils,
   image,
   imageName,
   architecture,
@@ -27,6 +32,7 @@ writeShellApplication {
   runtimeInputs = [
     awscli2
     jq
+    qemu-utils
   ];
   text = ''
     usage() {
@@ -53,7 +59,7 @@ writeShellApplication {
     export AWS_REGION="$region"
 
     imageFile=${image}/${image.filename}
-    key="$name.img"
+    key="$name.vmdk"
 
     amiId=$(aws ec2 describe-images --owners self --filters "Name=name,Values=$name" \
       --query 'Images[0].ImageId' --output text)
@@ -70,18 +76,24 @@ writeShellApplication {
     if [ "$snapshotId" != None ]; then
       echo "reusing snapshot $snapshotId" >&2
     else
-      size=$(stat -c %s "$imageFile")
+      tmpdir=$(mktemp -d)
+      trap 'rm -rf "$tmpdir"' EXIT
+      vmdk="$tmpdir/$key"
+      echo "converting $imageFile to compressed VMDK" >&2
+      qemu-img convert -f raw -O vmdk -o subformat=streamOptimized "$imageFile" "$vmdk"
+
+      size=$(stat -c %s "$vmdk")
       if [ "$(aws s3api head-object --bucket "$bucket" --key "$key" --query ContentLength --output text 2>/dev/null)" = "$size" ]; then
         echo "s3://$bucket/$key already uploaded" >&2
       else
-        echo "uploading $imageFile to s3://$bucket/$key" >&2
-        aws s3 cp "$imageFile" "s3://$bucket/$key"
+        echo "uploading $vmdk ($((size / 1024 / 1024)) MiB) to s3://$bucket/$key" >&2
+        aws s3 cp "$vmdk" "s3://$bucket/$key"
       fi
 
       echo "importing snapshot" >&2
       taskId=$(aws ec2 import-snapshot \
         --description "$name" \
-        --disk-container "Format=RAW,UserBucket={S3Bucket=$bucket,S3Key=$key}" \
+        --disk-container "Format=VMDK,UserBucket={S3Bucket=$bucket,S3Key=$key}" \
         --query ImportTaskId --output text)
 
       while true; do

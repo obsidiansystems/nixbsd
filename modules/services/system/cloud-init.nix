@@ -122,8 +122,11 @@ in
       system_info = lib.mkDefault {
         distro = "freebsd";
         # NixBSD manages /etc/rc.conf and the interfaces itself (dhcpcd), so
-        # never let cloud-init try to render network configuration.
-        network.renderers = [ ];
+        # network configuration is disabled below. A renderer still has to be
+        # named: the Ec2 datasource looks one up while building its network
+        # config, before the disabled check, and an empty list makes the
+        # whole `init` stage fail.
+        network.renderers = [ "freebsd" ];
         paths.run_dir = "/var/run/cloud-init/";
         ssh_svcname = "sshd";
         syslog_fix_perms = "root:wheel";

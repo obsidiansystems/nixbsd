@@ -60,8 +60,23 @@ let
     totalSize = if cfg.sizeMB == null then null else "${toString cfg.sizeMB}m";
   };
 
+  # What actually gets uploaded. VM Import doesn't accept compressed raw
+  # files, but the stream-optimized VMDK subformat is deflated internally, so
+  # a mostly-empty image uploads as a fraction of its size.
+  amazonImageVmdk =
+    pkgs.runCommand "${cfg.name}-vmdk"
+      {
+        nativeBuildInputs = [ pkgs.qemu-utils ];
+        passthru.filename = "${cfg.name}.vmdk";
+      }
+      ''
+        mkdir $out
+        qemu-img convert -f raw -O vmdk -o subformat=streamOptimized \
+          ${amazonImage}/${amazonImage.filename} $out/${cfg.name}.vmdk
+      '';
+
   uploadAmazonImage = pkgs.buildPackages.callPackage ./upload-ami.nix {
-    image = amazonImage;
+    image = amazonImageVmdk;
     imageName = cfg.name;
     architecture =
       {
@@ -153,6 +168,7 @@ in
     };
 
     system.build.amazonImage = amazonImage;
+    system.build.amazonImageVmdk = amazonImageVmdk;
     system.build.uploadAmazonImage = uploadAmazonImage;
   };
 }

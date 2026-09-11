@@ -410,6 +410,13 @@ in
           '';
         }
       ];
+
+      # Strip the NixBSD source tree from option declaration paths, like the
+      # nixpkgs tree already is. Otherwise the generated options documentation
+      # embeds `/nix/store/<hash>-source/modules/...`, and any change to the
+      # repository, however unrelated, rebuilds every system that includes the
+      # documentation.
+      documentation.nixos.extraModuleSources = [ ../.. ];
     }
 
     # The actual implementation for this lives in man-db.nix or mandoc.nix,
